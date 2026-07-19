@@ -1,19 +1,27 @@
 """
 capture_settrade.py
 --------------------
-Capture ข้อมูล Top Ranking / สรุปภาวะตลาด SET, mai จากหน้า
+Capture ข้อมูล 4 ตารางในแท็บ "ภาพรวม Top 20" ของหน้า
 https://www.settrade.com/th/equities/market-summary/top-ranking/overview
-แล้วส่งผลลัพธ์เข้า Google Sheet โดยตรง (ไม่บันทึกไฟล์ถาวรบนเครื่อง เพราะออกแบบ
-มาให้รันบน GitHub Actions ซึ่งเป็นเครื่องชั่วคราว)
+  - มูลค่าการซื้อขายสูงสุด (Most Active Value)
+  - ปริมาณการซื้อขายสูงสุด (Most Active Volume)
+  - ราคาเพิ่มขึ้นสูงสุด (Top Gainer)
+  - ราคาลดลงสูงสุด (Top Loser)
+ทั้ง 2 ตลาด (SET และ mai) รวมเป็น 8 ตาราง แล้วส่งเข้า Google Sheet โดยตรง
+(ไม่บันทึกไฟล์ถาวรบนเครื่อง เพราะออกแบบมาให้รันบน GitHub Actions ซึ่งเป็นเครื่อง
+ชั่วคราว)
 
 วิธีทำงาน:
 1. เปิดหน้าเว็บด้วย headless browser (Playwright) เพราะข้อมูลตารางถูกโหลด
    ด้วย JavaScript (client-side rendering)
-2. รอให้ตารางข้อมูลโหลดเสร็จ แล้วดึง HTML ที่ render แล้วออกมา
-3. ใช้ pandas.read_html() แกะตาราง <table> ทั้งหมดออกมาอัตโนมัติ
-4. ส่งแต่ละตาราง (ที่มีข้อมูลจริง ไม่ว่างเปล่า) เข้า Google Sheet คนละ worksheet
-   โดย "append" แถวใหม่พร้อม timestamp ต่อท้ายของเดิม -> เก็บเป็นประวัติสะสม
-   ทุกครั้งที่ capture
+2. รอจนกว่า placeholder (โครงตารางเปล่า) ที่ "มองเห็นอยู่จริง" จะหายไปหมด
+   (หน้านี้ฝังตารางของทุกแท็บไว้ใน HTML พร้อมกัน แต่โหลดข้อมูลจริงเฉพาะแท็บ/
+   ตลาดที่กำลังเปิดดูอยู่เท่านั้น จึงต้องดูเฉพาะของที่มองเห็นได้จริงบนจอ)
+3. ดึงเฉพาะตารางที่ "มองเห็นอยู่จริง" (4 ตารางของแท็บ ภาพรวม Top 20) ตอนอยู่
+   โหมด SET แล้วคลิกปุ่มสลับเป็น mai รอโหลดแล้ว capture ซ้ำอีกรอบ
+4. ส่งแต่ละตารางเข้า Google Sheet คนละ worksheet ชื่อสื่อความหมาย เช่น
+   SET_Most_Active_Value, mai_Top_Loser โดย "append" แถวใหม่พร้อม timestamp
+   ต่อท้ายของเดิม -> เก็บเป็นประวัติสะสมทุกครั้งที่ capture
 
 Environment variables ที่ต้องตั้ง (ตั้งผ่าน GitHub Actions secrets):
     GSHEET_ID                      -> ID ของ Google Sheet ปลายทาง
@@ -31,72 +39,90 @@ import traceback
 import datetime as dt
 
 import pandas as pd
-from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
 URL = "https://www.settrade.com/th/equities/market-summary/top-ranking/overview"
 
+# ลำดับตารางในแท็บ "ภาพรวม Top 20" ตามที่ปรากฏบนหน้าเว็บ (ซ้าย->ขวา, บน->ล่าง)
+TABLE_NAMES = ["Most_Active_Value", "Most_Active_Volume", "Top_Gainer", "Top_Loser"]
 
-def fetch_rendered_html() -> str:
-    """เปิดหน้าเว็บด้วย headless browser แล้วคืนค่า HTML ที่ render สมบูรณ์แล้ว"""
+MARKETS = ["SET", "mai"]
+
+
+def wait_for_visible_data_ready(page):
+    """รอจนกว่า placeholder (โครงตารางเปล่า) ที่มองเห็นอยู่จริงจะหายไปหมด"""
+    for _ in range(20):
+        if page.locator(".placeholder:visible").count() == 0:
+            return
+        page.wait_for_timeout(1000)
+    print("  คำเตือน: ยังมี placeholder ที่มองเห็นอยู่ หลังรอ 20 วินาที "
+          "(ข้อมูลบางส่วนอาจว่างเปล่า)")
+
+
+def switch_market(page, market: str):
+    """คลิกปุ่มสลับตลาด SET/mai ที่มุมขวาบนของหน้า"""
+    try:
+        page.get_by_role("button", name=market, exact=True).first.click(timeout=10000)
+    except Exception:
+        try:
+            page.get_by_text(market, exact=True).first.click(timeout=10000)
+        except Exception:
+            print(f"  คำเตือน: หาไม่ปุ่ม/ลิงก์ '{market}' เพื่อสลับตลาดไม่เจอ "
+                  "(อาจต้องปรับ selector)")
+
+
+def capture_visible_tables(page, market_label: str):
+    """ดึง 4 ตารางที่มองเห็นอยู่จริงบนจอตอนนี้ คืนค่าเป็น list ของ (ชื่อ, DataFrame)"""
+    visible_tables = page.locator("table:visible")
+    count = visible_tables.count()
+    results = []
+    for i in range(count):
+        try:
+            outer_html = visible_tables.nth(i).evaluate("el => el.outerHTML")
+        except Exception:
+            continue
+        try:
+            parsed = pd.read_html(outer_html)
+        except Exception:
+            # ข้ามตารางที่ parse ไม่ได้ ไม่ให้ทั้งสคริปต์ล้มเพราะตารางเดียว
+            continue
+        for t in parsed:
+            if t.dropna(how="all").empty:
+                continue
+            table_key = TABLE_NAMES[i] if i < len(TABLE_NAMES) else f"table_{i:02d}"
+            results.append((f"{market_label}_{table_key}", t))
+    return results
+
+
+def fetch_all_tables():
+    """เปิดหน้าเว็บ, capture ตาราง 4 อันของแท็บ Top 20 ทั้ง 2 ตลาด (SET, mai)"""
+    all_results = []
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         page = browser.new_page(viewport={"width": 1600, "height": 2200})
         try:
             # ไม่ใช้ wait_until="networkidle" เพราะหน้านี้มีสคริปต์โฆษณา/ตัวติดตาม
             # ผู้ใช้เชื่อมต่อเน็ตต่อเนื่องตลอดเวลา ทำให้ไม่มีวันถึงสถานะ idle จริง ๆ
-            # -> รอแค่โครงหน้าเว็บโหลดเสร็จก่อน แล้วค่อยรอตารางข้อมูลจริงแทน
             page.goto(URL, wait_until="domcontentloaded", timeout=60000)
             try:
                 page.wait_for_selector("table", timeout=30000)
             except PlaywrightTimeoutError:
                 print("  คำเตือน: รอตาราง (<table>) ไม่เจอภายในเวลาที่กำหนด")
 
-            # แท็ก <table> โผล่มาเร็ว แต่ตอนแรกยังเป็นโครงเปล่า (placeholder)
-            # อยู่ ต้องรอจนกว่า placeholder จะหายไปหมด (ข้อมูลจริงโหลดมาแทนที่
-            # แล้ว) ก่อนค่อยดึง HTML ออกมา เช็คทุก 1 วินาที นานสุด 20 วินาที
-            for _ in range(20):
-                placeholder_count = page.locator(".placeholder").count()
-                if placeholder_count == 0:
-                    break
-                page.wait_for_timeout(1000)
-            else:
-                print("  คำเตือน: ยังมี placeholder เหลืออยู่หลังรอ 20 วินาที "
-                      "(ข้อมูลบางตารางอาจว่างเปล่า)")
-
-            html = page.content()
+            for market in MARKETS:
+                print(f"  กำลัง capture ตลาด {market} ...")
+                switch_market(page, market)
+                wait_for_visible_data_ready(page)
+                results = capture_visible_tables(page, market)
+                print(f"    ได้ {len(results)} ตารางจากตลาด {market}")
+                all_results.extend(results)
         finally:
             browser.close()
-    return html
+    return all_results
 
 
-def extract_tables(html: str):
-    """
-    แกะเฉพาะแท็ก <table> ออกจาก HTML ก่อน (ด้วย BeautifulSoup) แล้วค่อยแปลงทีละ
-    ตารางด้วย pandas วิธีนี้ทนทานกว่าการยัด HTML ทั้งหน้าเข้า pd.read_html()
-    รวดเดียว เพราะหน้า settrade.com มี HTML จากสคริปต์โฆษณา/ตัวติดตามผู้ใช้
-    ปนอยู่เยอะมาก ถ้า parser สะดุดตรงไหนตรงหนึ่งจะทำให้ตารางทั้งหมดพังไปด้วย
-    ตัดปัญหานี้โดยแยก parse ทีละตารางเล็ก ๆ แทน
-    """
-    soup = BeautifulSoup(html, "lxml")
-    table_tags = soup.find_all("table")
-
-    tables = []
-    for tag in table_tags:
-        try:
-            parsed = pd.read_html(str(tag))
-        except Exception:
-            # ข้ามตารางที่ parse ไม่ได้ (เช่น เป็น placeholder ว่างเปล่าตอนตลาดปิด
-            # หรือมีโครงสร้าง HTML แปลก ๆ ปนมา) ไม่ให้ทั้งสคริปต์ล้มเพราะตารางเดียว
-            continue
-        for t in parsed:
-            if not t.dropna(how="all").empty:
-                tables.append(t)
-    return tables
-
-
-def push_to_gsheet(tables, timestamp: str):
-    """เขียนแต่ละตารางเข้า Google Sheet คนละ worksheet, append แถวใหม่ต่อท้าย"""
+def push_to_gsheet(named_tables, timestamp: str):
+    """เขียนแต่ละตารางเข้า Google Sheet คนละ worksheet (ตั้งชื่อตาม market+table)"""
     import gspread
     from google.oauth2.service_account import Credentials
 
@@ -114,8 +140,8 @@ def push_to_gsheet(tables, timestamp: str):
     gc = gspread.authorize(creds)
     sh = gc.open_by_key(sheet_id)
 
-    for i, table in enumerate(tables):
-        ws_name = f"table_{i:02d}"
+    for ws_name, table in named_tables:
+        ws_name = ws_name[:100]  # กัน worksheet name ยาวเกิน limit ของ Sheets
         try:
             ws = sh.worksheet(ws_name)
         except gspread.WorksheetNotFound:
@@ -136,16 +162,15 @@ def capture_once():
     timestamp_str = now.strftime("%Y-%m-%d %H:%M:%S")
     print(f"[{timestamp_str}] เริ่ม capture ข้อมูลจาก {URL}")
 
-    html = fetch_rendered_html()
-    tables = extract_tables(html)
+    named_tables = fetch_all_tables()
 
-    if not tables:
+    if not named_tables:
         print("  ไม่พบตารางข้อมูลใด ๆ ในหน้า (อาจต้องปรับ selector หรือ wait time) "
               "-> ข้ามการส่งเข้า Google Sheet รอบนี้")
         return
 
-    print(f"  พบตารางที่มีข้อมูล {len(tables)} ตาราง กำลังส่งเข้า Google Sheet...")
-    push_to_gsheet(tables, timestamp_str)
+    print(f"  พบตารางที่มีข้อมูลรวม {len(named_tables)} ตาราง กำลังส่งเข้า Google Sheet...")
+    push_to_gsheet(named_tables, timestamp_str)
 
 
 if __name__ == "__main__":
