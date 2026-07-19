@@ -95,21 +95,33 @@ def wait_for_tables_ready(page, min_tables=1, timeout_s=25):
 
 def capture_visible_tables(page, market_label: str):
     """ดึงตารางที่มองเห็นอยู่จริงบนจอตอนนี้ (ผ่าน JS) คืนค่าเป็น list ของ (ชื่อ, DataFrame)"""
-    table_htmls = page.evaluate(
+    diag = page.evaluate(
         """
-        () => Array.from(document.querySelectorAll('table'))
-            .filter(t => t.offsetParent !== null)
-            .map(t => t.outerHTML)
+        () => {
+            const all = Array.from(document.querySelectorAll('table'));
+            const visible = all.filter(t => t.offsetParent !== null);
+            return {
+                totalCount: all.length,
+                visibleCount: visible.length,
+                htmls: visible.map(t => t.outerHTML),
+            };
+        }
         """
     )
+    print(f"    [diag] เจอ <table> ทั้งหมด {diag['totalCount']} ตัว, "
+          f"มองเห็นได้ {diag['visibleCount']} ตัว")
+
     results = []
-    for i, outer_html in enumerate(table_htmls):
+    for i, outer_html in enumerate(diag["htmls"]):
+        print(f"    [diag] ตาราง #{i}: ยาว {len(outer_html)} ตัวอักษร")
         try:
             parsed = pd.read_html(outer_html)
-        except Exception:
-            # ข้ามตารางที่ parse ไม่ได้ ไม่ให้ทั้งสคริปต์ล้มเพราะตารางเดียว
+        except Exception as e:
+            print(f"    [diag] ตาราง #{i}: parse ไม่ผ่าน -> {type(e).__name__}: {str(e)[:150]}")
             continue
         for t in parsed:
+            print(f"    [diag] ตาราง #{i}: ขนาด {t.shape[0]} แถว x {t.shape[1]} คอลัมน์"
+                  f"{' (ว่างเปล่า)' if t.dropna(how='all').empty else ''}")
             if t.dropna(how="all").empty:
                 continue
             table_key = TABLE_NAMES[i] if i < len(TABLE_NAMES) else f"table_{i:02d}"
