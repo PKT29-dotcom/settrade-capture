@@ -74,7 +74,9 @@ def extract_tables(html: str):
     for tag in table_tags:
         try:
             parsed = pd.read_html(str(tag))
-        except (ValueError, ImportError):
+        except Exception:
+            # ข้ามตารางที่ parse ไม่ได้ (เช่น เป็น placeholder ว่างเปล่าตอนตลาดปิด
+            # หรือมีโครงสร้าง HTML แปลก ๆ ปนมา) ไม่ให้ทั้งสคริปต์ล้มเพราะตารางเดียว
             continue
         for t in parsed:
             if not t.dropna(how="all").empty:
