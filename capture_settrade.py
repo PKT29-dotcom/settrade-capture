@@ -49,14 +49,41 @@ TABLE_NAMES = ["Most_Active_Value", "Most_Active_Volume", "Top_Gainer", "Top_Los
 MARKETS = ["SET", "mai"]
 
 
-def wait_for_visible_data_ready(page):
-    """รอจนกว่า placeholder (โครงตารางเปล่า) ที่มองเห็นอยู่จริงจะหายไปหมด"""
-    for _ in range(20):
-        if page.locator(".placeholder:visible").count() == 0:
+def get_visibility_status(page):
+    """
+    เช็คสถานะการมองเห็นด้วย JavaScript โดยตรง (เชื่อถือได้กว่าการพึ่งพา
+    CSS pseudo-selector ':visible' ของ Playwright เพียงอย่างเดียว) คืนค่า
+    จำนวนตารางที่มองเห็นอยู่จริง และจำนวน placeholder ที่ยังมองเห็นอยู่
+    """
+    return page.evaluate(
+        """
+        () => {
+            const isVisible = (el) => el.offsetParent !== null;
+            const tables = Array.from(document.querySelectorAll('table')).filter(isVisible);
+            const placeholders = Array.from(document.querySelectorAll('.placeholder')).filter(isVisible);
+            return {tableCount: tables.length, placeholderCount: placeholders.length};
+        }
+        """
+    )
+
+
+def wait_for_tables_ready(page, min_tables=1, timeout_s=25):
+    """
+    รอจนกว่า (1) มีตารางที่มองเห็นอยู่จริงอย่างน้อย min_tables ตาราง และ
+    (2) ไม่มี placeholder ที่มองเห็นอยู่เหลือแล้ว ก่อนหน้านี้เช็คแค่เงื่อนไข (2)
+    อย่างเดียว ทำให้เกิด race condition ตอนคลิกสลับตลาด: เว็บถอด-สร้างตาราง
+    ใหม่ชั่วขณะ ทำให้ตอนเช็คไม่มีตารางอยู่เลย (placeholder=0 เพราะไม่มี element
+    ให้เช็คเลย ไม่ใช่เพราะโหลดเสร็จ) เลยผ่านเงื่อนไขไปแบบผิด ๆ ทันที
+    """
+    status = {"tableCount": 0, "placeholderCount": 0}
+    for _ in range(timeout_s):
+        status = get_visibility_status(page)
+        if status["tableCount"] >= min_tables and status["placeholderCount"] == 0:
             return
         page.wait_for_timeout(1000)
-    print("  คำเตือน: ยังมี placeholder ที่มองเห็นอยู่ หลังรอ 20 วินาที "
-          "(ข้อมูลบางส่วนอาจว่างเปล่า)")
+    print(f"  คำเตือน: หลังรอ {timeout_s} วินาที "
+          f"ตารางที่มองเห็น={status['tableCount']}, "
+          f"placeholder ที่ยังค้าง={status['placeholderCount']}")
 
 
 def switch_market(page, market: str):
@@ -69,18 +96,22 @@ def switch_market(page, market: str):
         except Exception:
             print(f"  คำเตือน: หาไม่ปุ่ม/ลิงก์ '{market}' เพื่อสลับตลาดไม่เจอ "
                   "(อาจต้องปรับ selector)")
+            return
+    # เผื่อเวลาให้หน้าเว็บเริ่มถอด-สร้างตารางใหม่ก่อนเริ่มเช็คสถานะ
+    page.wait_for_timeout(800)
 
 
 def capture_visible_tables(page, market_label: str):
-    """ดึง 4 ตารางที่มองเห็นอยู่จริงบนจอตอนนี้ คืนค่าเป็น list ของ (ชื่อ, DataFrame)"""
-    visible_tables = page.locator("table:visible")
-    count = visible_tables.count()
+    """ดึงตารางที่มองเห็นอยู่จริงบนจอตอนนี้ (ผ่าน JS) คืนค่าเป็น list ของ (ชื่อ, DataFrame)"""
+    table_htmls = page.evaluate(
+        """
+        () => Array.from(document.querySelectorAll('table'))
+            .filter(t => t.offsetParent !== null)
+            .map(t => t.outerHTML)
+        """
+    )
     results = []
-    for i in range(count):
-        try:
-            outer_html = visible_tables.nth(i).evaluate("el => el.outerHTML")
-        except Exception:
-            continue
+    for i, outer_html in enumerate(table_htmls):
         try:
             parsed = pd.read_html(outer_html)
         except Exception:
@@ -112,7 +143,7 @@ def fetch_all_tables():
             for market in MARKETS:
                 print(f"  กำลัง capture ตลาด {market} ...")
                 switch_market(page, market)
-                wait_for_visible_data_ready(page)
+                wait_for_tables_ready(page, min_tables=1, timeout_s=25)
                 results = capture_visible_tables(page, market)
                 print(f"    ได้ {len(results)} ตารางจากตลาด {market}")
                 all_results.extend(results)
