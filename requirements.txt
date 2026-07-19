@@ -1,0 +1,5 @@
+playwright>=1.44.0
+pandas>=2.0.0
+lxml>=5.0.0
+gspread>=6.0.0
+google-auth>=2.29.0
