@@ -51,8 +51,19 @@ def fetch_rendered_html() -> str:
                 page.wait_for_selector("table", timeout=30000)
             except PlaywrightTimeoutError:
                 print("  คำเตือน: รอตาราง (<table>) ไม่เจอภายในเวลาที่กำหนด")
-            # เผื่อข้อมูลบางส่วนโหลดช้ากว่านั้นอีกเล็กน้อย (AJAX เติมข้อมูลลงตาราง)
-            page.wait_for_timeout(5000)
+
+            # แท็ก <table> โผล่มาเร็ว แต่ตอนแรกยังเป็นโครงเปล่า (placeholder)
+            # อยู่ ต้องรอจนกว่า placeholder จะหายไปหมด (ข้อมูลจริงโหลดมาแทนที่
+            # แล้ว) ก่อนค่อยดึง HTML ออกมา เช็คทุก 1 วินาที นานสุด 20 วินาที
+            for _ in range(20):
+                placeholder_count = page.locator(".placeholder").count()
+                if placeholder_count == 0:
+                    break
+                page.wait_for_timeout(1000)
+            else:
+                print("  คำเตือน: ยังมี placeholder เหลืออยู่หลังรอ 20 วินาที "
+                      "(ข้อมูลบางตารางอาจว่างเปล่า)")
+
             html = page.content()
         finally:
             browser.close()
