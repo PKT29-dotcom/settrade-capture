@@ -43,12 +43,16 @@ def fetch_rendered_html() -> str:
         browser = p.chromium.launch(headless=True)
         page = browser.new_page(viewport={"width": 1600, "height": 2200})
         try:
-            page.goto(URL, wait_until="networkidle", timeout=60000)
+            # ไม่ใช้ wait_until="networkidle" เพราะหน้านี้มีสคริปต์โฆษณา/ตัวติดตาม
+            # ผู้ใช้เชื่อมต่อเน็ตต่อเนื่องตลอดเวลา ทำให้ไม่มีวันถึงสถานะ idle จริง ๆ
+            # -> รอแค่โครงหน้าเว็บโหลดเสร็จก่อน แล้วค่อยรอตารางข้อมูลจริงแทน
+            page.goto(URL, wait_until="domcontentloaded", timeout=60000)
             try:
-                page.wait_for_selector("table", timeout=20000)
+                page.wait_for_selector("table", timeout=30000)
             except PlaywrightTimeoutError:
                 print("  คำเตือน: รอตาราง (<table>) ไม่เจอภายในเวลาที่กำหนด")
-            page.wait_for_timeout(3000)
+            # เผื่อข้อมูลบางส่วนโหลดช้ากว่านั้นอีกเล็กน้อย (AJAX เติมข้อมูลลงตาราง)
+            page.wait_for_timeout(5000)
             html = page.content()
         finally:
             browser.close()
