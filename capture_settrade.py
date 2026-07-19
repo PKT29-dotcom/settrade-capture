@@ -17,8 +17,9 @@ https://www.settrade.com/th/equities/market-summary/top-ranking/overview
 2. รอจนกว่า placeholder (โครงตารางเปล่า) ที่ "มองเห็นอยู่จริง" จะหายไปหมด
    (หน้านี้ฝังตารางของทุกแท็บไว้ใน HTML พร้อมกัน แต่โหลดข้อมูลจริงเฉพาะแท็บ/
    ตลาดที่กำลังเปิดดูอยู่เท่านั้น จึงต้องดูเฉพาะของที่มองเห็นได้จริงบนจอ)
-3. ดึงเฉพาะตารางที่ "มองเห็นอยู่จริง" (4 ตารางของแท็บ ภาพรวม Top 20) ตอนอยู่
-   โหมด SET แล้วคลิกปุ่มสลับเป็น mai รอโหลดแล้ว capture ซ้ำอีกรอบ
+3. ดึงเฉพาะตารางที่ "มองเห็นอยู่จริง" (4 ตารางของแท็บ ภาพรวม Top 20) โดยเปิด
+   คนละ URL แยกกันสำหรับตลาด SET และ mai (ใช้ query parameter ?market=...
+   ของเว็บ แทนการคลิกปุ่มสลับ ซึ่งเจอปัญหา race condition)
 4. ส่งแต่ละตารางเข้า Google Sheet คนละ worksheet ชื่อสื่อความหมาย เช่น
    SET_Most_Active_Value, mai_Top_Loser โดย "append" แถวใหม่พร้อม timestamp
    ต่อท้ายของเดิม -> เก็บเป็นประวัติสะสมทุกครั้งที่ capture
@@ -41,12 +42,18 @@ import datetime as dt
 import pandas as pd
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
-URL = "https://www.settrade.com/th/equities/market-summary/top-ranking/overview"
+BASE_URL = "https://www.settrade.com/th/equities/market-summary/top-ranking/overview"
+
+# เปิดคนละ URL แยกกันสำหรับแต่ละตลาดโดยตรง (แทนการคลิกปุ่มสลับตลาดบนหน้าเว็บ
+# ซึ่งเจอปัญหา race condition ตอนหน้าเว็บถอด-สร้างตารางใหม่) เว็บ settrade.com
+# รองรับ query parameter "market" อยู่แล้ว เชื่อถือได้กว่ามาก
+MARKET_URLS = {
+    "SET": f"{BASE_URL}?market=SET&securityType=Common+Stock",
+    "mai": f"{BASE_URL}?market=mai&securityType=Common+Stock",
+}
 
 # ลำดับตารางในแท็บ "ภาพรวม Top 20" ตามที่ปรากฏบนหน้าเว็บ (ซ้าย->ขวา, บน->ล่าง)
 TABLE_NAMES = ["Most_Active_Value", "Most_Active_Volume", "Top_Gainer", "Top_Loser"]
-
-MARKETS = ["SET", "mai"]
 
 
 def get_visibility_status(page):
@@ -86,21 +93,6 @@ def wait_for_tables_ready(page, min_tables=1, timeout_s=25):
           f"placeholder ที่ยังค้าง={status['placeholderCount']}")
 
 
-def switch_market(page, market: str):
-    """คลิกปุ่มสลับตลาด SET/mai ที่มุมขวาบนของหน้า"""
-    try:
-        page.get_by_role("button", name=market, exact=True).first.click(timeout=10000)
-    except Exception:
-        try:
-            page.get_by_text(market, exact=True).first.click(timeout=10000)
-        except Exception:
-            print(f"  คำเตือน: หาไม่ปุ่ม/ลิงก์ '{market}' เพื่อสลับตลาดไม่เจอ "
-                  "(อาจต้องปรับ selector)")
-            return
-    # เผื่อเวลาให้หน้าเว็บเริ่มถอด-สร้างตารางใหม่ก่อนเริ่มเช็คสถานะ
-    page.wait_for_timeout(800)
-
-
 def capture_visible_tables(page, market_label: str):
     """ดึงตารางที่มองเห็นอยู่จริงบนจอตอนนี้ (ผ่าน JS) คืนค่าเป็น list ของ (ชื่อ, DataFrame)"""
     table_htmls = page.evaluate(
@@ -126,23 +118,23 @@ def capture_visible_tables(page, market_label: str):
 
 
 def fetch_all_tables():
-    """เปิดหน้าเว็บ, capture ตาราง 4 อันของแท็บ Top 20 ทั้ง 2 ตลาด (SET, mai)"""
+    """เปิดหน้าเว็บทีละตลาด (คนละ URL) แล้ว capture ตาราง 4 อันของแท็บ Top 20"""
     all_results = []
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         page = browser.new_page(viewport={"width": 1600, "height": 2200})
         try:
-            # ไม่ใช้ wait_until="networkidle" เพราะหน้านี้มีสคริปต์โฆษณา/ตัวติดตาม
-            # ผู้ใช้เชื่อมต่อเน็ตต่อเนื่องตลอดเวลา ทำให้ไม่มีวันถึงสถานะ idle จริง ๆ
-            page.goto(URL, wait_until="domcontentloaded", timeout=60000)
-            try:
-                page.wait_for_selector("table", timeout=30000)
-            except PlaywrightTimeoutError:
-                print("  คำเตือน: รอตาราง (<table>) ไม่เจอภายในเวลาที่กำหนด")
-
-            for market in MARKETS:
+            for market, market_url in MARKET_URLS.items():
                 print(f"  กำลัง capture ตลาด {market} ...")
-                switch_market(page, market)
+                # ไม่ใช้ wait_until="networkidle" เพราะหน้านี้มีสคริปต์โฆษณา/
+                # ตัวติดตามผู้ใช้เชื่อมต่อเน็ตต่อเนื่องตลอดเวลา ทำให้ไม่มีวันถึง
+                # สถานะ idle จริง ๆ
+                page.goto(market_url, wait_until="domcontentloaded", timeout=60000)
+                try:
+                    page.wait_for_selector("table", timeout=30000)
+                except PlaywrightTimeoutError:
+                    print("  คำเตือน: รอตาราง (<table>) ไม่เจอภายในเวลาที่กำหนด")
+
                 wait_for_tables_ready(page, min_tables=1, timeout_s=25)
                 results = capture_visible_tables(page, market)
                 print(f"    ได้ {len(results)} ตารางจากตลาด {market}")
@@ -191,7 +183,7 @@ def push_to_gsheet(named_tables, timestamp: str):
 def capture_once():
     now = dt.datetime.now()
     timestamp_str = now.strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[{timestamp_str}] เริ่ม capture ข้อมูลจาก {URL}")
+    print(f"[{timestamp_str}] เริ่ม capture ข้อมูลจาก {BASE_URL}")
 
     named_tables = fetch_all_tables()
 
