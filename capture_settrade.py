@@ -157,6 +157,39 @@ def fetch_all_tables():
     return all_results
 
 
+def clean_column_name(col) -> str:
+    """
+    ตัดข้อความหัวตารางที่ซ้ำกันออก เช่น "ราคาล่าสุด ราคาล่าสุด" -> "ราคาล่าสุด"
+    (เว็บ settrade.com ใส่ข้อความหัวตารางซ้ำ 2 ชุดใน HTML เดียวกัน ชุดหนึ่งไว้
+    แสดงผล อีกชุดซ่อนไว้สำหรับโปรแกรมอ่านหน้าจอ/screen reader)
+    """
+    if isinstance(col, tuple):
+        parts = [str(p) for p in col if str(p) not in ("", "nan")]
+        deduped = []
+        for p in parts:
+            if not deduped or deduped[-1] != p:
+                deduped.append(p)
+        col_str = " ".join(deduped)
+    else:
+        col_str = str(col)
+
+    stripped = col_str.replace(" ", "")
+    half = len(stripped) // 2
+    if half > 0 and len(stripped) % 2 == 0 and stripped[:half] == stripped[half:]:
+        # หาตำแหน่งใน col_str (ที่ยังมีช่องว่างเดิมอยู่) ที่ตรงกับความยาวครึ่งแรก
+        # แบบไม่นับช่องว่าง เพื่อคงช่องว่างที่ตั้งใจไว้จริงของข้อความส่วนแรก
+        count = 0
+        cut_index = len(col_str)
+        for idx, ch in enumerate(col_str):
+            if ch != " ":
+                count += 1
+            if count == half:
+                cut_index = idx + 1
+                break
+        col_str = col_str[:cut_index]
+    return col_str.strip()
+
+
 def push_to_gsheet(named_tables, timestamp: str):
     """เขียนแต่ละตารางเข้า Google Sheet คนละ worksheet (ตั้งชื่อตาม market+table)"""
     import gspread
@@ -182,7 +215,7 @@ def push_to_gsheet(named_tables, timestamp: str):
             ws = sh.worksheet(ws_name)
         except gspread.WorksheetNotFound:
             ws = sh.add_worksheet(title=ws_name, rows=2000, cols=30)
-            header = ["capture_time"] + [str(c) for c in table.columns]
+            header = ["capture_time"] + [clean_column_name(c) for c in table.columns]
             ws.append_row(header, value_input_option="USER_ENTERED")
 
         rows = table.fillna("").astype(str).values.tolist()
