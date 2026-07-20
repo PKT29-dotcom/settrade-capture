@@ -39,9 +39,12 @@ import io
 import sys
 import traceback
 import datetime as dt
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+
+BANGKOK_TZ = ZoneInfo("Asia/Bangkok")
 
 BASE_URL = "https://www.settrade.com/th/equities/market-summary/top-ranking/overview"
 
@@ -227,9 +230,9 @@ def push_to_gsheet(named_tables, timestamp: str):
 
 
 def capture_once():
-    now = dt.datetime.now()
+    now = dt.datetime.now(BANGKOK_TZ)
     timestamp_str = now.strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[{timestamp_str}] เริ่ม capture ข้อมูลจาก {BASE_URL}")
+    print(f"[{timestamp_str} เวลาไทย] เริ่ม capture ข้อมูลจาก {BASE_URL}")
 
     named_tables = fetch_all_tables()
 
