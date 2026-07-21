@@ -1,0 +1,27 @@
+name: Explore SET Overview Page (diagnostic)
+
+on:
+  workflow_dispatch: {}   # กดรันเองจากแท็บ Actions เท่านั้น (ยังไม่ตั้ง schedule)
+
+jobs:
+  explore:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Install Playwright browser
+        run: playwright install --with-deps chromium
+
+      - name: Run exploration script
+        run: python capture_setoverview.py
