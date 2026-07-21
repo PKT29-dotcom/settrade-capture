@@ -7,7 +7,15 @@ https://www.settrade.com/th/equities/market-summary/top-ranking/overview
   - ปริมาณการซื้อขายสูงสุด (Most Active Volume)
   - ราคาเพิ่มขึ้นสูงสุด (Top Gainer)
   - ราคาลดลงสูงสุด (Top Loser)
-ทั้ง 2 ตลาด (SET และ mai) รวมเป็น 8 ตาราง แล้วส่งเข้า Google Sheet โดยตรง
+ทั้ง 2 ตลาด (SET และ mai) แล้วส่งเข้า Google Sheet ของเราเอง (คนละไฟล์กับ
+Dashboard หลักที่ผู้ใช้ทำเอง) ในรูปแบบ "Master" ตาราง long format แถวต่อแถว
+เดียวกับ schema ของ TopDatabase ในไฟล์ Dashboard หลัก (Date, Time, Index,
+TopType, Rank, Symbol, Sector, Volume, Value, Last, Chg, Chg%) เพื่อให้ผู้ใช้
+copy ไปวางใน TopDatabase จริงได้สะดวกเวลามีเวลาว่าง
+
+ระบบนี้ทำหน้าที่เป็น "ตัวสำรอง" อัตโนมัติ สำหรับวันที่ผู้ใช้ติดธุระไม่ได้อยู่
+หน้าจอเพื่อ capture ข้อมูลเองด้วยมือตามปกติ
+
 (ไม่บันทึกไฟล์ถาวรบนเครื่อง เพราะออกแบบมาให้รันบน GitHub Actions ซึ่งเป็นเครื่อง
 ชั่วคราว)
 
@@ -15,14 +23,16 @@ https://www.settrade.com/th/equities/market-summary/top-ranking/overview
 1. เปิดหน้าเว็บด้วย headless browser (Playwright) เพราะข้อมูลตารางถูกโหลด
    ด้วย JavaScript (client-side rendering)
 2. รอจนกว่า placeholder (โครงตารางเปล่า) ที่ "มองเห็นอยู่จริง" จะหายไปหมด
-   (หน้านี้ฝังตารางของทุกแท็บไว้ใน HTML พร้อมกัน แต่โหลดข้อมูลจริงเฉพาะแท็บ/
-   ตลาดที่กำลังเปิดดูอยู่เท่านั้น จึงต้องดูเฉพาะของที่มองเห็นได้จริงบนจอ)
 3. ดึงเฉพาะตารางที่ "มองเห็นอยู่จริง" (4 ตารางของแท็บ ภาพรวม Top 20) โดยเปิด
    คนละ URL แยกกันสำหรับตลาด SET และ mai (ใช้ query parameter ?market=...
    ของเว็บ แทนการคลิกปุ่มสลับ ซึ่งเจอปัญหา race condition)
-4. ส่งแต่ละตารางเข้า Google Sheet คนละ worksheet ชื่อสื่อความหมาย เช่น
-   SET_Most_Active_Value, mai_Top_Loser โดย "append" แถวใหม่พร้อม timestamp
-   ต่อท้ายของเดิม -> เก็บเป็นประวัติสะสมทุกครั้งที่ capture
+4. ดาวน์โหลดรายชื่อบริษัทจดทะเบียนจาก SET (Symbol + กลุ่มอุตสาหกรรม +
+   หมวดธุรกิจ) อัปเดตแท็บ Sector_Map ในไฟล์เดียวกัน (ทุกครั้งที่ capture)
+5. แปลงข้อมูลทั้งหมดเป็นแถว Master format แล้ว append เข้าแท็บ Master
+   คอลัมน์ Sector เป็นสูตร VLOOKUP อ้างอิง Sector_Map ให้อัตโนมัติ
+6. เติมช่อง Value/Volume ที่ขาดหายไปในแต่ละแถว โดยจับคู่ Symbol ข้ามตาราง
+   ภายใน batch capture เดียวกัน (เช่น หุ้นที่โผล่ทั้งในตาราง Most Active Value
+   และ Most Active Volume พร้อมกัน จะได้ค่าครบทั้งคู่)
 
 Environment variables ที่ต้องตั้ง (ตั้งผ่าน GitHub Actions secrets):
     GSHEET_ID                      -> ID ของ Google Sheet ปลายทาง
@@ -41,7 +51,10 @@ import traceback
 import datetime as dt
 from zoneinfo import ZoneInfo
 
+import requests
 import pandas as pd
+import gspread
+from google.oauth2.service_account import Credentials
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
 BANGKOK_TZ = ZoneInfo("Asia/Bangkok")
@@ -56,8 +69,21 @@ MARKET_URLS = {
     "mai": f"{BASE_URL}?market=mai&securityType=Common+Stock",
 }
 
-# ลำดับตารางในแท็บ "ภาพรวม Top 20" ตามที่ปรากฏบนหน้าเว็บ (ซ้าย->ขวา, บน->ล่าง)
-TABLE_NAMES = ["Most_Active_Value", "Most_Active_Volume", "Top_Gainer", "Top_Loser"]
+# ป้ายชื่อประเภทตาราง (TopType) ตามลำดับที่ปรากฏบนหน้าเว็บ (ซ้าย->ขวา, บน->ล่าง)
+# ใช้ข้อความเดียวกับที่ปรากฏในคอลัมน์ TopType ของ TopDatabase (มีช่องว่าง ไม่ใช่ _)
+TABLE_TYPE_LABELS = ["Most Active Value", "Most Active Volume", "Top Gainer", "Top Loser"]
+
+# ไฟล์รายชื่อบริษัทจดทะเบียนทางการจาก SET (Symbol + กลุ่มอุตสาหกรรม + หมวดธุรกิจ)
+SET_LISTED_COMPANIES_XLS_URL = (
+    "https://www.set.or.th/dat/eod/listedcompany/static/listedCompanies_th_TH.xls"
+)
+SECTOR_MAP_SHEET_NAME = "Sector_Map"
+
+MASTER_SHEET_NAME = "Master"
+MASTER_HEADERS = [
+    "Date", "Time", "Index", "TopType", "Rank", "Symbol",
+    "Sector", "Volume", "Value", "Last", "Chg", "Chg%",
+]
 
 
 def get_visibility_status(page):
@@ -81,10 +107,7 @@ def get_visibility_status(page):
 def wait_for_tables_ready(page, min_tables=1, timeout_s=25):
     """
     รอจนกว่า (1) มีตารางที่มองเห็นอยู่จริงอย่างน้อย min_tables ตาราง และ
-    (2) ไม่มี placeholder ที่มองเห็นอยู่เหลือแล้ว ก่อนหน้านี้เช็คแค่เงื่อนไข (2)
-    อย่างเดียว ทำให้เกิด race condition ตอนคลิกสลับตลาด: เว็บถอด-สร้างตาราง
-    ใหม่ชั่วขณะ ทำให้ตอนเช็คไม่มีตารางอยู่เลย (placeholder=0 เพราะไม่มี element
-    ให้เช็คเลย ไม่ใช่เพราะโหลดเสร็จ) เลยผ่านเงื่อนไขไปแบบผิด ๆ ทันที
+    (2) ไม่มี placeholder ที่มองเห็นอยู่เหลือแล้ว
     """
     status = {"tableCount": 0, "placeholderCount": 0}
     for _ in range(timeout_s):
@@ -98,7 +121,8 @@ def wait_for_tables_ready(page, min_tables=1, timeout_s=25):
 
 
 def capture_visible_tables(page, market_label: str):
-    """ดึงตารางที่มองเห็นอยู่จริงบนจอตอนนี้ (ผ่าน JS) คืนค่าเป็น list ของ (ชื่อ, DataFrame)"""
+    """ดึงตารางที่มองเห็นอยู่จริงบนจอตอนนี้ (ผ่าน JS)
+    คืนค่าเป็น list ของ (market_label, table_type_label, DataFrame)"""
     diag = page.evaluate(
         """
         () => {
@@ -117,19 +141,16 @@ def capture_visible_tables(page, market_label: str):
 
     results = []
     for i, outer_html in enumerate(diag["htmls"]):
-        print(f"    [diag] ตาราง #{i}: ยาว {len(outer_html)} ตัวอักษร")
         try:
             parsed = pd.read_html(io.StringIO(outer_html))
         except Exception as e:
             print(f"    [diag] ตาราง #{i}: parse ไม่ผ่าน -> {type(e).__name__}: {str(e)[:150]}")
             continue
         for t in parsed:
-            print(f"    [diag] ตาราง #{i}: ขนาด {t.shape[0]} แถว x {t.shape[1]} คอลัมน์"
-                  f"{' (ว่างเปล่า)' if t.dropna(how='all').empty else ''}")
             if t.dropna(how="all").empty:
                 continue
-            table_key = TABLE_NAMES[i] if i < len(TABLE_NAMES) else f"table_{i:02d}"
-            results.append((f"{market_label}_{table_key}", t))
+            table_type = TABLE_TYPE_LABELS[i] if i < len(TABLE_TYPE_LABELS) else f"table_{i:02d}"
+            results.append((market_label, table_type, t))
     return results
 
 
@@ -179,8 +200,6 @@ def clean_column_name(col) -> str:
     stripped = col_str.replace(" ", "")
     half = len(stripped) // 2
     if half > 0 and len(stripped) % 2 == 0 and stripped[:half] == stripped[half:]:
-        # หาตำแหน่งใน col_str (ที่ยังมีช่องว่างเดิมอยู่) ที่ตรงกับความยาวครึ่งแรก
-        # แบบไม่นับช่องว่าง เพื่อคงช่องว่างที่ตั้งใจไว้จริงของข้อความส่วนแรก
         count = 0
         cut_index = len(col_str)
         for idx, ch in enumerate(col_str):
@@ -193,11 +212,174 @@ def clean_column_name(col) -> str:
     return col_str.strip()
 
 
-def push_to_gsheet(named_tables, timestamp: str):
-    """เขียนแต่ละตารางเข้า Google Sheet คนละ worksheet (ตั้งชื่อตาม market+table)"""
-    import gspread
-    from google.oauth2.service_account import Credentials
+def extract_row_fields(cleaned_cols, row):
+    """
+    แปลงแถวดิบ (cleaned_cols คู่กับค่าจริงใน row) ให้เป็น dict ตาม schema ของ
+    Master: Rank, Symbol, Value, Volume, Last, Chg, ChgPct
+    ตารางแต่ละประเภทมีแค่ Value หรือ Volume อย่างใดอย่างหนึ่ง (ไม่ใช่ทั้งคู่) เพราะ
+    ดึงมาจากหน้า Top Ranking โดยตรง อีกช่องจะเว้นว่างไว้
+    """
+    fields = {"Rank": "", "Symbol": "", "Value": "", "Volume": "", "Last": "", "Chg": "", "ChgPct": ""}
+    for col_name, val in zip(cleaned_cols, row):
+        if "อันดับ" in col_name:
+            fields["Rank"] = val
+        elif "ชื่อย่อ" in col_name or "หลักทรัพย์" in col_name:
+            fields["Symbol"] = val
+        elif "มูลค่า" in col_name:
+            fields["Value"] = val
+        elif "ปริมาณ" in col_name:
+            fields["Volume"] = val
+        elif "เปลี่ยนแปลง" in col_name and "%" in col_name:
+            fields["ChgPct"] = val
+        elif "เปลี่ยนแปลง" in col_name:
+            fields["Chg"] = val
+        elif "ราคา" in col_name and "ล่าสุด" in col_name:
+            fields["Last"] = val
+    return fields
 
+
+def _find_column_by_keywords(columns, keywords):
+    """หาชื่อคอลัมน์ที่มีคำใน keywords ปนอยู่ (ไม่สนตัวพิมพ์เล็ก-ใหญ่) คืนชื่อคอลัมน์จริง หรือ None"""
+    for col in columns:
+        col_str = str(col)
+        for kw in keywords:
+            if kw.lower() in col_str.lower():
+                return col
+    return None
+
+
+def update_sector_map(sh):
+    """
+    ดาวน์โหลดรายชื่อบริษัทจดทะเบียนทั้งหมดจากเว็บทางการของ SET (Symbol +
+    กลุ่มอุตสาหกรรม + หมวดธุรกิจ) แล้วอัปเดตแท็บ Sector_Map ทั้งหมด (เขียนทับ
+    ของเดิม เพราะเป็นตารางอ้างอิงล่าสุด ไม่ใช่ประวัติสะสม)
+
+    ออกแบบให้ "ไม่ทำให้การ capture หลักล้ม" หากขั้นตอนนี้ผิดพลาด จะแค่ print
+    คำเตือนแล้วข้ามไป ไม่ raise exception ออกไปนอกฟังก์ชันนี้
+    """
+    print("  กำลังอัปเดต Sector_Map จากรายชื่อบริษัทจดทะเบียนของ SET ...")
+    try:
+        resp = requests.get(
+            SET_LISTED_COMPANIES_XLS_URL,
+            headers={"User-Agent": "Mozilla/5.0 (compatible; SettradeCaptureBot/1.0)"},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        df = pd.read_excel(io.BytesIO(resp.content))
+    except Exception as e:
+        print(f"    คำเตือน: ดาวน์โหลด/อ่านไฟล์รายชื่อบริษัทจาก SET ไม่สำเร็จ -> "
+              f"{type(e).__name__}: {str(e)[:150]} (ข้ามการอัปเดต Sector_Map รอบนี้)")
+        return
+
+    print(f"    [diag] คอลัมน์ที่พบในไฟล์: {list(df.columns)}")
+
+    symbol_col = _find_column_by_keywords(df.columns, ["symbol", "หลักทรัพย์", "ย่อ"])
+    industry_col = _find_column_by_keywords(df.columns, ["กลุ่มอุตสาหกรรม", "industry"])
+    sector_col = _find_column_by_keywords(df.columns, ["หมวดธุรกิจ", "sector"])
+
+    if symbol_col is None:
+        print("    คำเตือน: หาคอลัมน์ชื่อย่อหลักทรัพย์ในไฟล์ไม่เจอ "
+              "(ข้ามการอัปเดต Sector_Map รอบนี้)")
+        return
+
+    out = pd.DataFrame({
+        "Symbol": df[symbol_col].astype(str).str.strip(),
+        "IndustryGroup": df[industry_col].astype(str).str.strip() if industry_col is not None else "",
+        "Sector": df[sector_col].astype(str).str.strip() if sector_col is not None else "",
+    }).drop_duplicates(subset=["Symbol"])
+
+    try:
+        ws = sh.worksheet(SECTOR_MAP_SHEET_NAME)
+        ws.clear()
+    except gspread.WorksheetNotFound:
+        ws = sh.add_worksheet(title=SECTOR_MAP_SHEET_NAME, rows=len(out) + 10, cols=5)
+
+    rows = [out.columns.tolist()] + out.astype(str).values.tolist()
+    ws.update(rows, value_input_option="USER_ENTERED")
+    print(f"    อัปเดต Sector_Map สำเร็จ ({len(out)} บริษัท)")
+
+
+def build_cross_reference_lookups(results):
+    """
+    สร้าง lookup dict ต่อตลาด สำหรับเติม Value/Volume ที่ขาดหายไป โดยจับคู่ Symbol
+    ข้ามตารางภายใน batch capture เดียวกัน (เช่น หุ้นที่โผล่ทั้งในตาราง Most
+    Active Value และ Most Active Volume พร้อมกัน จะเอาค่าที่ขาดจากอีกตาราง
+    มาเติมให้ครบทั้งคู่)
+
+    คืนค่า: {market: {"value": {symbol: value}, "volume": {symbol: volume}}}
+    """
+    lookups = {}
+    for market_label, table_type, table in results:
+        if market_label not in lookups:
+            lookups[market_label] = {"value": {}, "volume": {}}
+        cleaned_cols = [clean_column_name(c) for c in table.columns]
+        raw_rows = table.fillna("").astype(str).values.tolist()
+        for raw_row in raw_rows:
+            f = extract_row_fields(cleaned_cols, raw_row)
+            symbol = f["Symbol"]
+            if not symbol:
+                continue
+            if f["Value"] and symbol not in lookups[market_label]["value"]:
+                lookups[market_label]["value"][symbol] = f["Value"]
+            if f["Volume"] and symbol not in lookups[market_label]["volume"]:
+                lookups[market_label]["volume"][symbol] = f["Volume"]
+    return lookups
+
+
+def push_to_master(sh, results, date_str: str, time_str: str):
+    """
+    เขียนข้อมูลทั้งหมดลงแท็บ Master เดียว แบบแถวต่อแถว (long format) ตรงกับ
+    schema ของ TopDatabase (Date, Time, Index, TopType, Rank, Symbol, Sector,
+    Volume, Value, Last, Chg, Chg%) คอลัมน์ Sector เป็นสูตร VLOOKUP อ้างอิง
+    แท็บ Sector_Map ในไฟล์เดียวกันให้อัตโนมัติ
+    """
+    try:
+        ws = sh.worksheet(MASTER_SHEET_NAME)
+    except gspread.WorksheetNotFound:
+        ws = sh.add_worksheet(title=MASTER_SHEET_NAME, rows=2000, cols=15)
+        ws.append_row(MASTER_HEADERS, value_input_option="USER_ENTERED")
+
+    existing_row_count = len(ws.get_all_values())
+    start_row = existing_row_count + 1
+
+    symbol_col_index = MASTER_HEADERS.index("Symbol") + 1  # 1-based
+    symbol_col_letter = gspread.utils.rowcol_to_a1(1, symbol_col_index).rstrip("0123456789")
+
+    lookups = build_cross_reference_lookups(results)
+
+    rows_to_append = []
+    for market_label, table_type, table in results:
+        cleaned_cols = [clean_column_name(c) for c in table.columns]
+        raw_rows = table.fillna("").astype(str).values.tolist()
+        for raw_row in raw_rows:
+            row_num = start_row + len(rows_to_append)
+            f = extract_row_fields(cleaned_cols, raw_row)
+            symbol = f["Symbol"]
+            market_lookup = lookups.get(market_label, {"value": {}, "volume": {}})
+            if not f["Value"]:
+                f["Value"] = market_lookup["value"].get(symbol, "")
+            if not f["Volume"]:
+                f["Volume"] = market_lookup["volume"].get(symbol, "")
+            sector_formula = (
+                f'=IFERROR(VLOOKUP({symbol_col_letter}{row_num},'
+                f'{SECTOR_MAP_SHEET_NAME}!A:C,3,FALSE),"")'
+            )
+            rows_to_append.append([
+                date_str, time_str, market_label, table_type,
+                f["Rank"], f["Symbol"], sector_formula,
+                f["Volume"], f["Value"], f["Last"], f["Chg"], f["ChgPct"],
+            ])
+
+    if not rows_to_append:
+        print("  ไม่มีแถวข้อมูลจะส่งเข้า Master")
+        return
+
+    ws.append_rows(rows_to_append, value_input_option="USER_ENTERED")
+    print(f"  ส่ง {len(rows_to_append)} แถว เข้า worksheet '{MASTER_SHEET_NAME}'")
+
+
+def get_open_spreadsheet():
+    """สร้าง gspread client และเปิด Google Sheet ปลายทาง (ใช้ร่วมกันทั้งสองขั้นตอน)"""
     sheet_id = os.environ.get("GSHEET_ID")
     creds_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
 
@@ -210,39 +392,33 @@ def push_to_gsheet(named_tables, timestamp: str):
     scopes = ["https://www.googleapis.com/auth/spreadsheets"]
     creds = Credentials.from_service_account_file(creds_path, scopes=scopes)
     gc = gspread.authorize(creds)
-    sh = gc.open_by_key(sheet_id)
-
-    for ws_name, table in named_tables:
-        ws_name = ws_name[:100]  # กัน worksheet name ยาวเกิน limit ของ Sheets
-        try:
-            ws = sh.worksheet(ws_name)
-        except gspread.WorksheetNotFound:
-            ws = sh.add_worksheet(title=ws_name, rows=2000, cols=30)
-            header = ["capture_time"] + [clean_column_name(c) for c in table.columns]
-            ws.append_row(header, value_input_option="USER_ENTERED")
-
-        rows = table.fillna("").astype(str).values.tolist()
-        rows_with_ts = [[timestamp] + row for row in rows]
-        ws.append_rows(rows_with_ts, value_input_option="USER_ENTERED")
-        print(f"  ส่ง {len(rows_with_ts)} แถว เข้า worksheet '{ws_name}'")
-
-    print(f"  เสร็จสิ้น: ส่งข้อมูลเข้า Google Sheet (id: {sheet_id}) เรียบร้อย")
+    return gc.open_by_key(sheet_id)
 
 
 def capture_once():
     now = dt.datetime.now(BANGKOK_TZ)
-    timestamp_str = now.strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[{timestamp_str} เวลาไทย] เริ่ม capture ข้อมูลจาก {BASE_URL}")
+    date_str = now.strftime("%d/%m/%Y")
+    time_str = now.strftime("%H:%M")
+    print(f"[{date_str} {time_str} เวลาไทย] เริ่ม capture ข้อมูลจาก {BASE_URL}")
 
-    named_tables = fetch_all_tables()
+    sh = get_open_spreadsheet()
 
-    if not named_tables:
+    # อัปเดต Sector_Map ก่อน (ถ้าพลาดจะแค่ print คำเตือน ไม่กระทบงานหลักด้านล่าง)
+    try:
+        update_sector_map(sh)
+    except Exception:
+        print("  คำเตือน: อัปเดต Sector_Map ไม่สำเร็จ (ไม่กระทบการ capture หลัก):")
+        traceback.print_exc(limit=3, file=sys.stdout)
+
+    results = fetch_all_tables()
+
+    if not results:
         print("  ไม่พบตารางข้อมูลใด ๆ ในหน้า (อาจต้องปรับ selector หรือ wait time) "
               "-> ข้ามการส่งเข้า Google Sheet รอบนี้")
         return
 
-    print(f"  พบตารางที่มีข้อมูลรวม {len(named_tables)} ตาราง กำลังส่งเข้า Google Sheet...")
-    push_to_gsheet(named_tables, timestamp_str)
+    print(f"  พบตารางที่มีข้อมูลรวม {len(results)} ตาราง กำลังส่งเข้า Google Sheet...")
+    push_to_master(sh, results, date_str, time_str)
 
 
 if __name__ == "__main__":
