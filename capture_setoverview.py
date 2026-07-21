@@ -31,53 +31,37 @@ import pandas as pd
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
 SET_HOME_URL = "https://www.set.or.th/en/home"
+MAI_OVERVIEW_URL = "https://www.set.or.th/en/market/index/mai/overview"
 
 
-def explore_page():
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        page = browser.new_page(viewport={"width": 1600, "height": 2400})
-        try:
-            page.goto(SET_HOME_URL, wait_until="domcontentloaded", timeout=60000)
-            try:
-                page.wait_for_selector("table", timeout=30000)
-            except PlaywrightTimeoutError:
-                print("คำเตือน: รอตาราง (<table>) ไม่เจอภายในเวลาที่กำหนด")
+def explore_url(page, url, label):
+    print("\n" + "#" * 70)
+    print(f"# สำรวจหน้า: {label} ({url})")
+    print("#" * 70)
 
-            # เผื่อข้อมูลบางส่วนโหลดช้ากว่านั้นอีกเล็กน้อย
-            page.wait_for_timeout(4000)
+    page.goto(url, wait_until="domcontentloaded", timeout=60000)
+    try:
+        page.wait_for_selector("table", timeout=15000)
+    except PlaywrightTimeoutError:
+        print("คำเตือน: รอตาราง (<table>) ไม่เจอภายในเวลาที่กำหนด")
+    page.wait_for_timeout(4000)
 
-            diag = page.evaluate(
-                """
-                () => {
-                    const all = Array.from(document.querySelectorAll('table'));
-                    const visible = all.filter(t => t.offsetParent !== null);
-                    return {
-                        totalCount: all.length,
-                        visibleCount: visible.length,
-                        htmls: visible.map(t => t.outerHTML),
-                    };
-                }
-                """
-            )
+    diag = page.evaluate(
+        """
+        () => {
+            const all = Array.from(document.querySelectorAll('table'));
+            const visible = all.filter(t => t.offsetParent !== null);
+            return {
+                totalCount: all.length,
+                visibleCount: visible.length,
+                htmls: visible.map(t => t.outerHTML),
+            };
+        }
+        """
+    )
+    top_text = page.evaluate("() => (document.body.innerText || '').slice(0, 2500)")
 
-            # ดึงข้อความในกล่องสรุปด้านบนสุด (SET / mai / TFEX) เผื่อไม่ได้อยู่ใน table
-            # ลองดึงข้อความของ element ที่มีคำว่า "SET" "mai" "TFEX" ปนอยู่ในบริเวณ
-            # ต้นหน้า (1500px แรกจากบน) มาดูโครงสร้างคร่าว ๆ
-            top_text = page.evaluate(
-                """
-                () => {
-                    const body = document.body.innerText || "";
-                    return body.slice(0, 3000);
-                }
-                """
-            )
-        finally:
-            browser.close()
-
-    print("=" * 70)
     print(f"[diag] เจอ <table> ทั้งหมด {diag['totalCount']} ตัว, มองเห็นได้ {diag['visibleCount']} ตัว")
-    print("=" * 70)
 
     for i, html in enumerate(diag["htmls"]):
         print(f"\n----- ตาราง #{i} (ยาว {len(html)} ตัวอักษร) -----")
@@ -92,11 +76,19 @@ def explore_page():
             print(t.head(15).to_string())
             print()
 
-    print("=" * 70)
-    print("[diag] ข้อความ 3000 ตัวอักษรแรกของหน้า (body.innerText) "
-          "สำหรับหาตัวเลข Last/Change/%Change ที่อาจไม่ได้อยู่ใน <table>:")
-    print("=" * 70)
+    print(f"\n[diag] ข้อความ 2500 ตัวอักษรแรกของหน้า {label} (body.innerText):")
     print(top_text)
+
+
+def explore_page():
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        page = browser.new_page(viewport={"width": 1600, "height": 2400})
+        try:
+            explore_url(page, SET_HOME_URL, "SET Home")
+            explore_url(page, MAI_OVERVIEW_URL, "mai Overview")
+        finally:
+            browser.close()
 
 
 if __name__ == "__main__":
