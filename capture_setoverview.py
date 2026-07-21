@@ -179,13 +179,27 @@ def fetch_set_home_data(page):
 
 
 def fetch_mai_overview_data(page):
-    """เปิดหน้า mai Overview แล้วดึง Value (M.Baht) ของ mai"""
+    """
+    เปิดหน้า mai Overview แล้วดึง Value (M.Baht) ของ mai
+
+    หน้านี้มีคำว่า "Value (M.Baht)" โผล่ 2 จุด: จุดแรกเป็นของ SET (ค้างมาจาก
+    กล่องสรุปด้านบนสุดของหน้า ก่อนถึงส่วน mai Index) จุดที่สองถึงจะเป็นของ mai
+    จริง ๆ (อยู่หลังคำว่า "mai Index") จึงต้องตัดข้อความให้เหลือเฉพาะส่วนหลัง
+    "mai Index" ก่อนค้นหา ไม่เช่นนั้นจะได้ค่าของ SET ผิดตัวมาแทน
+    """
     page.goto(MAI_OVERVIEW_URL, wait_until="domcontentloaded", timeout=60000)
     page.wait_for_timeout(4000)
 
     body_text = page.evaluate("() => document.body.innerText || ''")
 
-    value_match = re.search(r"Value \(M\.Baht\)\s+([\d,.\-]+)", body_text)
+    mai_index_pos = body_text.find("mai Index")
+    if mai_index_pos == -1:
+        print("  คำเตือน: หาจุดเริ่มต้นส่วน 'mai Index' ในหน้า mai Overview ไม่เจอ")
+        mai_section = body_text
+    else:
+        mai_section = body_text[mai_index_pos:]
+
+    value_match = re.search(r"Value \(M\.Baht\)\s+([\d,.\-]+)", mai_section)
     mai_value = value_match.group(1) if value_match else ""
     if not mai_value:
         print("  คำเตือน: หา mai Value (M.Baht) ในหน้า mai Overview ไม่เจอ")
