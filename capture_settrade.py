@@ -68,7 +68,7 @@ BASE_URL = "https://www.settrade.com/th/equities/market-summary/top-ranking/over
 # รองรับ query parameter "market" อยู่แล้ว เชื่อถือได้กว่ามาก
 MARKET_URLS = {
     "SET": f"{BASE_URL}?market=SET&securityType=Common+Stock",
-    "mai": f"{BASE_URL}?market=mai&securityType=Common+Stock",
+    "MAI": f"{BASE_URL}?market=mai&securityType=Common+Stock",  # URL param ต้องเป็น mai ตัวเล็กตามที่เว็บ settrade.com กำหนด แต่ label แสดงผลใช้ MAI ตัวใหญ่ให้เข้าชุดกับ SET
 }
 
 # ป้ายชื่อประเภทตาราง (TopType) ตามลำดับที่ปรากฏบนหน้าเว็บ (ซ้าย->ขวา, บน->ล่าง)
@@ -267,6 +267,13 @@ def clean_symbol(raw_symbol: str, known_symbols=None) -> str:
     return best_candidate if best_candidate else s
 
 
+def _dash_to_zero(val):
+    """เว็บ settrade.com แสดง '-' แทน 0.00 เวลาราคาไม่มีการเปลี่ยนแปลง
+    แปลงเป็นเลข 0 ก่อนส่งเข้า Google Sheet เพื่อให้เป็นตัวเลขที่คำนวณต่อได้"""
+    s = str(val).strip()
+    return "0" if s in ("-", "", "nan", "NaN") else val
+
+
 def extract_row_fields(cleaned_cols, row, known_symbols=None):
     """
     แปลงแถวดิบ (cleaned_cols คู่กับค่าจริงใน row) ให้เป็น dict ตาม schema ของ
@@ -285,9 +292,9 @@ def extract_row_fields(cleaned_cols, row, known_symbols=None):
         elif "ปริมาณ" in col_name:
             fields["Volume"] = val
         elif "เปลี่ยนแปลง" in col_name and "%" in col_name:
-            fields["ChgPct"] = val
+            fields["ChgPct"] = _dash_to_zero(val)
         elif "เปลี่ยนแปลง" in col_name:
-            fields["Chg"] = val
+            fields["Chg"] = _dash_to_zero(val)
         elif "ราคา" in col_name and "ล่าสุด" in col_name:
             fields["Last"] = val
     return fields
