@@ -1,0 +1,41 @@
+name: Capture Sector Index Data
+
+on:
+  schedule:
+    # 18:30 น. เวลาไทย = 11:30 UTC (เยื้องนาทีเล็กน้อยเหมือนตัวอื่น ๆ
+    # เพื่อลดโอกาสชนคิวกับ workflow อื่นทั่วโลก)
+    - cron: '35 11 * * 1-5'
+  workflow_dispatch: {}   # ปุ่มกดรันทดสอบเองได้ในแท็บ Actions
+
+jobs:
+  capture:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Install Playwright browser
+        run: playwright install --with-deps chromium
+
+      - name: Decode Google service-account credentials
+        run: echo "${{ secrets.GOOGLE_CREDENTIALS_BASE64 }}" | base64 -d > gcp-credentials.json
+
+      - name: Run capture script
+        env:
+          GSHEET_ID: ${{ secrets.GSHEET_ID }}
+          GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/gcp-credentials.json
+        run: python capture_sectorindex.py
+
+      - name: Remove credentials file
+        if: always()
+        run: rm -f gcp-credentials.json
