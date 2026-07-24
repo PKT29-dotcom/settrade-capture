@@ -96,7 +96,7 @@ MASTER_HEADERS = [
 # ทำงานตรงเวลาไหม รอบไหน fail บ้าง เพื่อวิเคราะห์ปัญหาความล่าช้าของ
 # GitHub Actions schedule ได้ง่ายขึ้น
 LOG_SHEET_NAME = "Log"
-LOG_HEADERS = ["Date", "Time", "Trigger", "Status", "RowsSent", "Detail"]
+LOG_HEADERS = ["Date", "Time", "Workflow", "Trigger", "Status", "RowsSent", "Detail"]
 
 
 def get_visibility_status(page):
@@ -403,12 +403,24 @@ def push_to_master(sh, results, date_str: str, time_str: str, trigger_label: str
     print(f"  ส่ง {len(rows_to_append)} แถว เข้า worksheet '{MASTER_SHEET_NAME}'")
 
 
-def push_to_log(sh, date_str: str, time_str: str, trigger_label: str,
+def get_workflow_name() -> str:
+    """
+    อ่านชื่อ workflow จาก environment variable ที่ GitHub Actions ตั้งให้
+    อัตโนมัติ (GITHUB_WORKFLOW) ตรงกับค่า name: ในไฟล์ .yml เอง ไม่ต้อง
+    hardcode ชื่อซ้ำในโค้ด ถ้าเปลี่ยนชื่อ workflow ทีหลัง Log จะอัปเดตตามอัตโนมัติ
+    (ถ้ารันในเครื่องตัวเอง ไม่มีตัวแปรนี้ จะขึ้นเป็น "local" แทน)
+    """
+    return os.environ.get("GITHUB_WORKFLOW", "local")
+
+
+def push_to_log(sh, date_str: str, time_str: str, workflow_name: str, trigger_label: str,
                  status: str, rows_sent, detail: str = ""):
     """
     บันทึกประวัติการรัน 1 แถวต่อ 1 ครั้งที่รัน ลงแท็บ Log แยกจาก Master
     เพื่อให้ตรวจสอบย้อนหลังได้ว่า schedule ทำงานตรงเวลาไหม รอบไหนหายไป/fail
     บันทึกทุกครั้งไม่ว่าจะสำเร็จ ล้มเหลว หรือไม่พบข้อมูล เพื่อให้เห็นภาพครบ
+    คอลัมน์ Workflow บอกว่าแถวนี้มาจาก workflow ไหน (เพราะ Log แท็บนี้ใช้ร่วมกัน
+    ทั้ง capture_settrade.py, capture_setoverview.py, capture_sectorindex.py)
     """
     try:
         ws = sh.worksheet(LOG_SHEET_NAME)
@@ -417,7 +429,7 @@ def push_to_log(sh, date_str: str, time_str: str, trigger_label: str,
         ws.append_row(LOG_HEADERS, value_input_option="USER_ENTERED")
 
     ws.append_row(
-        [date_str, time_str, trigger_label, status, rows_sent, detail],
+        [date_str, time_str, workflow_name, trigger_label, status, rows_sent, detail],
         value_input_option="USER_ENTERED",
     )
 
@@ -462,8 +474,9 @@ def capture_once():
     date_str = now.strftime("%d/%m/%Y")
     time_str = now.strftime("%H:%M")
     trigger_label = get_trigger_label()
+    workflow_name = get_workflow_name()
     print(f"[{date_str} {time_str} เวลาไทย] เริ่ม capture ข้อมูลจาก {BASE_URL} "
-          f"(trigger: {trigger_label})")
+          f"(workflow: {workflow_name}, trigger: {trigger_label})")
 
     # เปิด Google Sheet ก่อน เพื่อให้บันทึก Log ได้แม้ขั้นตอนถัดไปจะล้มเหลว
     sh = get_open_spreadsheet()
@@ -472,13 +485,13 @@ def capture_once():
         results = fetch_all_tables()
     except Exception as e:
         detail = f"{type(e).__name__}: {str(e)[:200]}"
-        push_to_log(sh, date_str, time_str, trigger_label, "Failed", 0, detail)
+        push_to_log(sh, date_str, time_str, workflow_name, trigger_label, "Failed", 0, detail)
         raise
 
     if not results:
         print("  ไม่พบตารางข้อมูลใด ๆ ในหน้า (อาจต้องปรับ selector หรือ wait time) "
               "-> ข้ามการส่งเข้า Google Sheet รอบนี้")
-        push_to_log(sh, date_str, time_str, trigger_label, "NoData", 0,
+        push_to_log(sh, date_str, time_str, workflow_name, trigger_label, "NoData", 0,
                     "ไม่พบตารางข้อมูลในหน้าเว็บ")
         return
 
@@ -488,10 +501,10 @@ def capture_once():
         push_to_master(sh, results, date_str, time_str, trigger_label)
     except Exception as e:
         detail = f"{type(e).__name__}: {str(e)[:200]}"
-        push_to_log(sh, date_str, time_str, trigger_label, "Failed", 0, detail)
+        push_to_log(sh, date_str, time_str, workflow_name, trigger_label, "Failed", 0, detail)
         raise
 
-    push_to_log(sh, date_str, time_str, trigger_label, "Success", total_rows, "")
+    push_to_log(sh, date_str, time_str, workflow_name, trigger_label, "Success", total_rows, "")
 
 
 if __name__ == "__main__":
