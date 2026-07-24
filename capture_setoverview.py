@@ -54,6 +54,11 @@ SETDATABASE_HEADERS = [
     "TFEX Vol", "TFEX OI", "TFEX Prem/Disc",
 ]
 
+# แท็บเก็บประวัติการรันทุกครั้ง (ใช้ร่วมกับ capture_settrade.py และ
+# capture_sectorindex.py) คอลัมน์ Workflow บอกว่าแถวนี้มาจาก workflow ไหน
+LOG_SHEET_NAME = "Log"
+LOG_HEADERS = ["Date", "Time", "Workflow", "Trigger", "Status", "RowsSent", "Detail"]
+
 
 def _num(x):
     """แปลงข้อความตัวเลข (มี comma/เว้นวรรค) เป็น float แบบปลอดภัย คืน '' ถ้าแปลงไม่ได้"""
@@ -279,18 +284,68 @@ def push_row_to_setdatabase(sh, row):
     print(f"  ส่ง 1 แถว เข้า worksheet '{SETDATABASE_SHEET_NAME}'")
 
 
+def get_trigger_label() -> str:
+    """อ่านประเภทของ trigger จาก GITHUB_EVENT_NAME (Scheduled/Manual/local)"""
+    event_name = os.environ.get("GITHUB_EVENT_NAME", "")
+    if event_name == "schedule":
+        return "Scheduled"
+    elif event_name == "workflow_dispatch":
+        return "Manual"
+    elif event_name:
+        return event_name
+    return "local"
+
+
+def get_workflow_name() -> str:
+    """อ่านชื่อ workflow จาก GITHUB_WORKFLOW (ตรงกับ name: ในไฟล์ .yml เอง)"""
+    return os.environ.get("GITHUB_WORKFLOW", "local")
+
+
+def push_to_log(sh, date_str: str, time_str: str, workflow_name: str, trigger_label: str,
+                 status: str, rows_sent, detail: str = ""):
+    """บันทึกประวัติการรันลงแท็บ Log เดียวกับสคริปต์อื่นในชุดนี้"""
+    try:
+        ws = sh.worksheet(LOG_SHEET_NAME)
+    except gspread.WorksheetNotFound:
+        ws = sh.add_worksheet(title=LOG_SHEET_NAME, rows=2000, cols=10)
+        ws.append_row(LOG_HEADERS, value_input_option="USER_ENTERED")
+
+    ws.append_row(
+        [date_str, time_str, workflow_name, trigger_label, status, rows_sent, detail],
+        value_input_option="USER_ENTERED",
+    )
+
+
 def capture_once():
     now = dt.datetime.now(BANGKOK_TZ)
     date_str = now.strftime("%d/%m/%Y")
-    print(f"[{date_str} {now.strftime('%H:%M')} เวลาไทย] เริ่ม capture ข้อมูลจาก set.or.th")
+    time_str = now.strftime("%H:%M")
+    trigger_label = get_trigger_label()
+    workflow_name = get_workflow_name()
+    print(f"[{date_str} {time_str} เวลาไทย] เริ่ม capture ข้อมูลจาก set.or.th "
+          f"(workflow: {workflow_name}, trigger: {trigger_label})")
 
-    data = fetch_all_setoverview_data()
-    row = build_setdatabase_row(data, date_str)
+    # เปิด Google Sheet ก่อน เพื่อให้บันทึก Log ได้แม้ขั้นตอนถัดไปจะล้มเหลว
+    sh = get_open_spreadsheet()
+
+    try:
+        data = fetch_all_setoverview_data()
+        row = build_setdatabase_row(data, date_str)
+    except Exception as e:
+        detail = f"{type(e).__name__}: {str(e)[:200]}"
+        push_to_log(sh, date_str, time_str, workflow_name, trigger_label, "Failed", 0, detail)
+        raise
 
     print(f"  แถวที่จะส่ง: {row}")
 
-    sh = get_open_spreadsheet()
-    push_row_to_setdatabase(sh, row)
+    try:
+        push_row_to_setdatabase(sh, row)
+    except Exception as e:
+        detail = f"{type(e).__name__}: {str(e)[:200]}"
+        push_to_log(sh, date_str, time_str, workflow_name, trigger_label, "Failed", 0, detail)
+        raise
+
+    push_to_log(sh, date_str, time_str, workflow_name, trigger_label, "Success", 1, "")
 
 
 if __name__ == "__main__":
