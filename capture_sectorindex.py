@@ -43,7 +43,7 @@ BANGKOK_TZ = ZoneInfo("Asia/Bangkok")
 BASE_URL = "https://www.settrade.com/th/equities/market-data/overview?category=Industry-Sector"
 
 # 8 รหัสกลุ่มอุตสาหกรรมใหญ่ (Industry Group) ที่เหลือทั้งหมดในตารางคือหมวด
-# ธุรกิจย่อย (Sector) ใช้แยก Level ของแต่ละแถว
+# ธุรกิจย่อย (Sector)
 GROUP_CODES = {
     "AGRO", "CONSUMP", "FINCIAL", "INDUS",
     "PROPCON", "RESOURC", "SERVICE", "TECH",
@@ -66,7 +66,7 @@ SECTOR_TO_GROUP = {
 
 SECTORINDEX_SHEET_NAME = "SectorIndex"
 SECTORINDEX_HEADERS = [
-    "Date", "SourceTime", "Market", "Level", "Code", "ParentGroup", "Name",
+    "Date", "Time", "Market", "Group", "Sector", "Name",
     "Last", "Chg", "Chg%", "Volume('000 Shares)", "Value(MB)", "Trigger",
 ]
 
@@ -75,16 +75,22 @@ LOG_HEADERS = ["Date", "Time", "Trigger", "Status", "RowsSent", "Detail"]
 
 NAME_CODE_RE = re.compile(r"^(.*?)\s*\(([A-Z&]+)\)\s*$")
 
-# จับข้อความ "ข้อมูลล่าสุด 22 ก.ค. 2569 14:36:41" ที่โชว์บนหน้าเว็บ (เวลาข้อมูล
-# จริงจากฝั่ง settrade.com ต่างจากเวลาที่ script รันเอง)
-SOURCE_TIME_RE = re.compile(r"ข้อมูลล่าสุด\s+(\d{1,2}\s+\S+\.?\s+\d{4}\s+\d{1,2}:\d{2}:\d{2})")
+# จับข้อความ "ข้อมูลล่าสุด 22 ก.ค. 2569 14:36:41" ที่โชว์บนหน้าเว็บ แยกเป็น
+# กลุ่มวันที่ กับ กลุ่มเวลา คนละส่วนกัน (เวลาข้อมูลจริงจากฝั่ง settrade.com
+# ต่างจากเวลาที่ script รันเอง)
+SOURCE_TIME_RE = re.compile(
+    r"ข้อมูลล่าสุด\s+(\d{1,2}\s+\S+\.?\s+\d{4})\s+(\d{1,2}:\d{2}:\d{2})"
+)
 
 
-def get_source_timestamp(page) -> str:
-    """ดึงข้อความ 'ข้อมูลล่าสุด ...' จากหน้าเว็บ คืนค่าว่างถ้าหาไม่เจอ"""
+def get_source_datetime(page):
+    """ดึงวันที่/เวลาจากข้อความ 'ข้อมูลล่าสุด ...' บนหน้าเว็บ คืนค่า (date, time)
+    เป็น string คู่ หรือ ('', '') ถ้าหาไม่เจอ"""
     body_text = page.evaluate("() => document.body.innerText || ''")
     m = SOURCE_TIME_RE.search(body_text)
-    return m.group(1) if m else ""
+    if not m:
+        return "", ""
+    return m.group(1), m.group(2)
 
 
 def get_trigger_label() -> str:
@@ -126,14 +132,15 @@ def parse_sector_table(html):
         if not m:
             continue  # ข้ามแถวที่ parse ชื่อ/รหัสไม่ได้ (กันโครงสร้างแปลก ๆ)
         name, code = m.group(1).strip(), m.group(2).strip()
-        level = "Group" if code in GROUP_CODES else "Sector"
-        # แถวระดับ Group ให้ ParentGroup เป็นรหัสตัวเอง (ไว้ให้ filter/pivot ง่าย)
-        # แถวระดับ Sector ให้ ParentGroup เป็นรหัสกลุ่มใหญ่ที่มันสังกัดอยู่
-        parent_group = code if level == "Group" else SECTOR_TO_GROUP.get(code, "")
+        if code in GROUP_CODES:
+            # แถวสรุปของกลุ่มใหญ่เอง -> Group = รหัสกลุ่ม, Sector เว้นว่างไว้
+            group_code, sector_code = code, ""
+        else:
+            # แถวหมวดธุรกิจย่อย -> Group = กลุ่มใหญ่ที่สังกัด, Sector = รหัสตัวเอง
+            group_code, sector_code = SECTOR_TO_GROUP.get(code, ""), code
         rows.append({
-            "Level": level,
-            "Code": code,
-            "ParentGroup": parent_group,
+            "Group": group_code,
+            "Sector": sector_code,
             "Name": name,
             "Last": row.get("ล่าสุด", ""),
             "Chg": row.get("เปลี่ยนแปลง", ""),
@@ -177,11 +184,12 @@ def fetch_sector_index_data():
             html = get_visible_table_html(page)
             if html:
                 set_rows = parse_sector_table(html)
-                source_time = get_source_timestamp(page)
-                print(f"    ได้ {len(set_rows)} แถวจากตลาด SET (ข้อมูลล่าสุด: {source_time or 'ไม่พบ'})")
+                src_date, src_time = get_source_datetime(page)
+                print(f"    ได้ {len(set_rows)} แถวจากตลาด SET (ข้อมูลล่าสุด: {src_date} {src_time})")
                 for r in set_rows:
                     r["Market"] = "SET"
-                    r["SourceTime"] = source_time
+                    r["Date"] = src_date
+                    r["Time"] = src_time
                 all_rows.extend(set_rows)
             else:
                 print("  คำเตือน: ไม่พบตารางข้อมูลของตลาด SET")
@@ -195,11 +203,12 @@ def fetch_sector_index_data():
                 html = get_visible_table_html(page)
                 if html:
                     mai_rows = parse_sector_table(html)
-                    source_time = get_source_timestamp(page)
-                    print(f"    ได้ {len(mai_rows)} แถวจากตลาด mai (ข้อมูลล่าสุด: {source_time or 'ไม่พบ'})")
+                    src_date, src_time = get_source_datetime(page)
+                    print(f"    ได้ {len(mai_rows)} แถวจากตลาด mai (ข้อมูลล่าสุด: {src_date} {src_time})")
                     for r in mai_rows:
                         r["Market"] = "mai"
-                        r["SourceTime"] = source_time
+                        r["Date"] = src_date
+                        r["Time"] = src_time
                     all_rows.extend(mai_rows)
                 else:
                     print("  คำเตือน: ไม่พบตารางข้อมูลของตลาด mai")
@@ -224,7 +233,7 @@ def get_open_spreadsheet():
     return gc.open_by_key(sheet_id)
 
 
-def push_to_sectorindex(sh, all_rows, date_str: str, trigger_label: str):
+def push_to_sectorindex(sh, all_rows, trigger_label: str):
     try:
         ws = sh.worksheet(SECTORINDEX_SHEET_NAME)
     except gspread.WorksheetNotFound:
@@ -234,8 +243,8 @@ def push_to_sectorindex(sh, all_rows, date_str: str, trigger_label: str):
     rows_to_append = []
     for r in all_rows:
         rows_to_append.append([
-            date_str, r.get("SourceTime", ""), r["Market"], r["Level"], r["Code"],
-            r["ParentGroup"], r["Name"],
+            r.get("Date", ""), r.get("Time", ""),
+            r["Market"], r["Group"], r["Sector"], r["Name"],
             r["Last"], r["Chg"], r["Chg%"], r["Volume"], r["Value"],
             trigger_label,
         ])
@@ -287,7 +296,7 @@ def capture_once():
         return
 
     try:
-        rows_sent = push_to_sectorindex(sh, all_rows, date_str, trigger_label)
+        rows_sent = push_to_sectorindex(sh, all_rows, trigger_label)
     except Exception as e:
         detail = f"{type(e).__name__}: {str(e)[:200]}"
         push_to_log(sh, date_str, time_str, trigger_label, "Failed", 0, detail)
