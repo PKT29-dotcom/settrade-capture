@@ -49,9 +49,24 @@ GROUP_CODES = {
     "PROPCON", "RESOURC", "SERVICE", "TECH",
 }
 
+# แผนที่ว่าแต่ละหมวดธุรกิจย่อย (Sector) อยู่ในกลุ่มอุตสาหกรรมใหญ่ (Group) ไหน
+# อ้างอิงจากโครงสร้างจริงของหน้าเว็บ settrade.com (คงที่ ไม่เปลี่ยนบ่อย)
+SECTOR_TO_GROUP = {
+    "AGRI": "AGRO", "FOOD": "AGRO",
+    "FASHION": "CONSUMP", "HOME": "CONSUMP", "PERSON": "CONSUMP",
+    "BANK": "FINCIAL", "FIN": "FINCIAL", "INSUR": "FINCIAL",
+    "AUTO": "INDUS", "IMM": "INDUS", "PAPER": "INDUS",
+    "PETRO": "INDUS", "PKG": "INDUS", "STEEL": "INDUS",
+    "CONMAT": "PROPCON", "PROP": "PROPCON", "PF&REIT": "PROPCON", "CONS": "PROPCON",
+    "ENERG": "RESOURC", "MINE": "RESOURC",
+    "COMM": "SERVICE", "HELTH": "SERVICE", "MEDIA": "SERVICE",
+    "PROF": "SERVICE", "TOURISM": "SERVICE", "TRANS": "SERVICE",
+    "ETRON": "TECH", "ICT": "TECH",
+}
+
 SECTORINDEX_SHEET_NAME = "SectorIndex"
 SECTORINDEX_HEADERS = [
-    "Date", "Market", "Level", "Code", "Name",
+    "Date", "SourceTime", "Market", "Level", "Code", "ParentGroup", "Name",
     "Last", "Chg", "Chg%", "Volume('000 Shares)", "Value(MB)", "Trigger",
 ]
 
@@ -59,6 +74,17 @@ LOG_SHEET_NAME = "Log"
 LOG_HEADERS = ["Date", "Time", "Trigger", "Status", "RowsSent", "Detail"]
 
 NAME_CODE_RE = re.compile(r"^(.*?)\s*\(([A-Z&]+)\)\s*$")
+
+# จับข้อความ "ข้อมูลล่าสุด 22 ก.ค. 2569 14:36:41" ที่โชว์บนหน้าเว็บ (เวลาข้อมูล
+# จริงจากฝั่ง settrade.com ต่างจากเวลาที่ script รันเอง)
+SOURCE_TIME_RE = re.compile(r"ข้อมูลล่าสุด\s+(\d{1,2}\s+\S+\.?\s+\d{4}\s+\d{1,2}:\d{2}:\d{2})")
+
+
+def get_source_timestamp(page) -> str:
+    """ดึงข้อความ 'ข้อมูลล่าสุด ...' จากหน้าเว็บ คืนค่าว่างถ้าหาไม่เจอ"""
+    body_text = page.evaluate("() => document.body.innerText || ''")
+    m = SOURCE_TIME_RE.search(body_text)
+    return m.group(1) if m else ""
 
 
 def get_trigger_label() -> str:
@@ -101,9 +127,13 @@ def parse_sector_table(html):
             continue  # ข้ามแถวที่ parse ชื่อ/รหัสไม่ได้ (กันโครงสร้างแปลก ๆ)
         name, code = m.group(1).strip(), m.group(2).strip()
         level = "Group" if code in GROUP_CODES else "Sector"
+        # แถวระดับ Group ให้ ParentGroup เป็นรหัสตัวเอง (ไว้ให้ filter/pivot ง่าย)
+        # แถวระดับ Sector ให้ ParentGroup เป็นรหัสกลุ่มใหญ่ที่มันสังกัดอยู่
+        parent_group = code if level == "Group" else SECTOR_TO_GROUP.get(code, "")
         rows.append({
             "Level": level,
             "Code": code,
+            "ParentGroup": parent_group,
             "Name": name,
             "Last": row.get("ล่าสุด", ""),
             "Chg": row.get("เปลี่ยนแปลง", ""),
@@ -147,9 +177,11 @@ def fetch_sector_index_data():
             html = get_visible_table_html(page)
             if html:
                 set_rows = parse_sector_table(html)
-                print(f"    ได้ {len(set_rows)} แถวจากตลาด SET")
+                source_time = get_source_timestamp(page)
+                print(f"    ได้ {len(set_rows)} แถวจากตลาด SET (ข้อมูลล่าสุด: {source_time or 'ไม่พบ'})")
                 for r in set_rows:
                     r["Market"] = "SET"
+                    r["SourceTime"] = source_time
                 all_rows.extend(set_rows)
             else:
                 print("  คำเตือน: ไม่พบตารางข้อมูลของตลาด SET")
@@ -163,9 +195,11 @@ def fetch_sector_index_data():
                 html = get_visible_table_html(page)
                 if html:
                     mai_rows = parse_sector_table(html)
-                    print(f"    ได้ {len(mai_rows)} แถวจากตลาด mai")
+                    source_time = get_source_timestamp(page)
+                    print(f"    ได้ {len(mai_rows)} แถวจากตลาด mai (ข้อมูลล่าสุด: {source_time or 'ไม่พบ'})")
                     for r in mai_rows:
                         r["Market"] = "mai"
+                        r["SourceTime"] = source_time
                     all_rows.extend(mai_rows)
                 else:
                     print("  คำเตือน: ไม่พบตารางข้อมูลของตลาด mai")
@@ -200,7 +234,8 @@ def push_to_sectorindex(sh, all_rows, date_str: str, trigger_label: str):
     rows_to_append = []
     for r in all_rows:
         rows_to_append.append([
-            date_str, r["Market"], r["Level"], r["Code"], r["Name"],
+            date_str, r.get("SourceTime", ""), r["Market"], r["Level"], r["Code"],
+            r["ParentGroup"], r["Name"],
             r["Last"], r["Chg"], r["Chg%"], r["Volume"], r["Value"],
             trigger_label,
         ])
