@@ -71,7 +71,7 @@ SECTORINDEX_HEADERS = [
 ]
 
 LOG_SHEET_NAME = "Log"
-LOG_HEADERS = ["Date", "Time", "Trigger", "Status", "RowsSent", "Detail"]
+LOG_HEADERS = ["Date", "Time", "Workflow", "Trigger", "Status", "RowsSent", "Detail"]
 
 NAME_CODE_RE = re.compile(r"^(.*?)\s*\(([A-Z&]+)\)\s*$")
 
@@ -102,6 +102,11 @@ def get_trigger_label() -> str:
     elif event_name:
         return event_name
     return "local"
+
+
+def get_workflow_name() -> str:
+    """อ่านชื่อ workflow จาก GITHUB_WORKFLOW (ตรงกับ name: ในไฟล์ .yml เอง)"""
+    return os.environ.get("GITHUB_WORKFLOW", "local")
 
 
 def get_visible_table_html(page):
@@ -258,7 +263,7 @@ def push_to_sectorindex(sh, all_rows, trigger_label: str):
     return len(rows_to_append)
 
 
-def push_to_log(sh, date_str: str, time_str: str, trigger_label: str,
+def push_to_log(sh, date_str: str, time_str: str, workflow_name: str, trigger_label: str,
                  status: str, rows_sent, detail: str = ""):
     try:
         ws = sh.worksheet(LOG_SHEET_NAME)
@@ -267,7 +272,7 @@ def push_to_log(sh, date_str: str, time_str: str, trigger_label: str,
         ws.append_row(LOG_HEADERS, value_input_option="USER_ENTERED")
 
     ws.append_row(
-        [date_str, time_str, trigger_label, status, rows_sent, detail],
+        [date_str, time_str, workflow_name, trigger_label, status, rows_sent, detail],
         value_input_option="USER_ENTERED",
     )
 
@@ -277,8 +282,9 @@ def capture_once():
     date_str = now.strftime("%d/%m/%Y")
     time_str = now.strftime("%H:%M")
     trigger_label = get_trigger_label()
+    workflow_name = get_workflow_name()
     print(f"[{date_str} {time_str} เวลาไทย] เริ่ม capture ดัชนีกลุ่มอุตสาหกรรมจาก {BASE_URL} "
-          f"(trigger: {trigger_label})")
+          f"(workflow: {workflow_name}, trigger: {trigger_label})")
 
     sh = get_open_spreadsheet()
 
@@ -286,12 +292,12 @@ def capture_once():
         all_rows = fetch_sector_index_data()
     except Exception as e:
         detail = f"{type(e).__name__}: {str(e)[:200]}"
-        push_to_log(sh, date_str, time_str, trigger_label, "Failed", 0, detail)
+        push_to_log(sh, date_str, time_str, workflow_name, trigger_label, "Failed", 0, detail)
         raise
 
     if not all_rows:
         print("  ไม่พบข้อมูลดัชนีกลุ่มอุตสาหกรรมเลย -> ข้ามการส่งเข้า Google Sheet รอบนี้")
-        push_to_log(sh, date_str, time_str, trigger_label, "NoData", 0,
+        push_to_log(sh, date_str, time_str, workflow_name, trigger_label, "NoData", 0,
                     "ไม่พบข้อมูลดัชนีกลุ่มอุตสาหกรรม")
         return
 
@@ -299,10 +305,10 @@ def capture_once():
         rows_sent = push_to_sectorindex(sh, all_rows, trigger_label)
     except Exception as e:
         detail = f"{type(e).__name__}: {str(e)[:200]}"
-        push_to_log(sh, date_str, time_str, trigger_label, "Failed", 0, detail)
+        push_to_log(sh, date_str, time_str, workflow_name, trigger_label, "Failed", 0, detail)
         raise
 
-    push_to_log(sh, date_str, time_str, trigger_label, "Success", rows_sent, "")
+    push_to_log(sh, date_str, time_str, workflow_name, trigger_label, "Success", rows_sent, "")
 
 
 if __name__ == "__main__":
