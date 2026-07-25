@@ -79,18 +79,43 @@ NAME_CODE_RE = re.compile(r"^(.*?)\s*\(([A-Z&]+)\)\s*$")
 # กลุ่มวันที่ กับ กลุ่มเวลา คนละส่วนกัน (เวลาข้อมูลจริงจากฝั่ง settrade.com
 # ต่างจากเวลาที่ script รันเอง)
 SOURCE_TIME_RE = re.compile(
-    r"ข้อมูลล่าสุด\s+(\d{1,2}\s+\S+\.?\s+\d{4})\s+(\d{1,2}:\d{2}:\d{2})"
+    r"ข้อมูลล่าสุด\s+(\d{1,2})\s+(\S+?)\.?\s+(\d{4})\s+(\d{1,2}):(\d{2}):(\d{2})"
 )
+
+THAI_MONTH_ABBR = {
+    "ม.ค": 1, "ก.พ": 2, "มี.ค": 3, "เม.ย": 4, "พ.ค": 5, "มิ.ย": 6,
+    "ก.ค": 7, "ส.ค": 8, "ก.ย": 9, "ต.ค": 10, "พ.ย": 11, "ธ.ค": 12,
+}
 
 
 def get_source_datetime(page):
-    """ดึงวันที่/เวลาจากข้อความ 'ข้อมูลล่าสุด ...' บนหน้าเว็บ คืนค่า (date, time)
-    เป็น string คู่ หรือ ('', '') ถ้าหาไม่เจอ"""
+    """
+    ดึงวันที่/เวลาจากข้อความ 'ข้อมูลล่าสุด ...' บนหน้าเว็บ (เป็นวันที่แบบไทย
+    เช่น '22 ก.ค. 2569') แล้วแปลงเป็น:
+      - date: string รูปแบบ "DD/MM/YYYY" ปฏิทินสากล (แปลง พ.ศ. -> ค.ศ. โดย
+        ลบ 543 ให้เอง)
+      - time: string รูปแบบ "HH:MM" (ตัดวินาทีทิ้ง)
+    คืนค่า ('', '') ถ้าหาข้อความหรือแปลงเดือนไทยไม่สำเร็จ
+
+    ไม่ปล่อยให้ Google Sheets เดารูปแบบวันที่เอง เพราะเคยเจอปัญหาแสดงผลไม่
+    สม่ำเสมอ (บางแถวโชว์ "24/07/2026" บางแถวโชว์ "24 ก.ค. 2569" ปนกัน) ต้อง
+    ควบคุมรูปแบบให้แน่นอนจากฝั่งโค้ดเอง แล้วบังคับเก็บเป็นข้อความล้วนตอนส่งเข้า
+    Sheet (ดู push_to_sectorindex)
+    """
     body_text = page.evaluate("() => document.body.innerText || ''")
     m = SOURCE_TIME_RE.search(body_text)
     if not m:
         return "", ""
-    return m.group(1), m.group(2)
+
+    day, month_abbr, buddhist_year, hh, mm, _ss = m.groups()
+    month_num = THAI_MONTH_ABBR.get(month_abbr.strip())
+    if month_num is None:
+        return "", ""
+
+    gregorian_year = int(buddhist_year) - 543
+    date_str = f"{int(day):02d}/{month_num:02d}/{gregorian_year}"
+    time_str = f"{int(hh):02d}:{mm}"
+    return date_str, time_str
 
 
 def get_trigger_label() -> str:
@@ -243,12 +268,17 @@ def push_to_sectorindex(sh, all_rows, trigger_label: str):
         ws = sh.worksheet(SECTORINDEX_SHEET_NAME)
     except gspread.WorksheetNotFound:
         ws = sh.add_worksheet(title=SECTORINDEX_SHEET_NAME, rows=3000, cols=15)
-        ws.append_row(SECTORINDEX_HEADERS, value_input_option="USER_ENTERED")
+        ws.append_row(SECTORINDEX_HEADERS, value_input_option="USER_ENTERED", table_range="A1")
 
     rows_to_append = []
     for r in all_rows:
+        # ขึ้นต้นด้วย ' เพื่อบังคับให้ Google Sheets เก็บเป็นข้อความล้วน ไม่ตี
+        # ความเป็นวันที่จริงเอง (กันปัญหาแสดงผลไม่สม่ำเสมอ เช่น บางแถวโชว์
+        # "24/07/2026" บางแถวโชว์ "24 ก.ค. 2569" เพราะ locale/auto-format)
+        date_val = f"'{r.get('Date', '')}" if r.get("Date") else ""
+        time_val = f"'{r.get('Time', '')}" if r.get("Time") else ""
         rows_to_append.append([
-            r.get("Date", ""), r.get("Time", ""),
+            date_val, time_val,
             r["Market"], r["Group"], r["Sector"], r["Name"],
             r["Last"], r["Chg"], r["Chg%"], r["Volume"], r["Value"],
             trigger_label,
@@ -258,7 +288,7 @@ def push_to_sectorindex(sh, all_rows, trigger_label: str):
         print("  ไม่มีแถวข้อมูลจะส่งเข้า SectorIndex")
         return 0
 
-    ws.append_rows(rows_to_append, value_input_option="USER_ENTERED")
+    ws.append_rows(rows_to_append, value_input_option="USER_ENTERED", table_range="A1")
     print(f"  ส่ง {len(rows_to_append)} แถว เข้า worksheet '{SECTORINDEX_SHEET_NAME}'")
     return len(rows_to_append)
 
@@ -269,11 +299,12 @@ def push_to_log(sh, date_str: str, time_str: str, workflow_name: str, trigger_la
         ws = sh.worksheet(LOG_SHEET_NAME)
     except gspread.WorksheetNotFound:
         ws = sh.add_worksheet(title=LOG_SHEET_NAME, rows=2000, cols=10)
-        ws.append_row(LOG_HEADERS, value_input_option="USER_ENTERED")
+        ws.append_row(LOG_HEADERS, value_input_option="USER_ENTERED", table_range="A1")
 
     ws.append_row(
         [date_str, time_str, workflow_name, trigger_label, status, rows_sent, detail],
         value_input_option="USER_ENTERED",
+        table_range="A1",
     )
 
 
