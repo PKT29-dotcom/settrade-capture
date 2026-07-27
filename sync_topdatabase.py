@@ -108,10 +108,8 @@ def get_workflow_name() -> str:
 
 def push_to_log(sh, date_str: str, time_str: str, workflow_name: str, trigger_label: str,
                  status: str, rows_sent, detail: str = ""):
-    try:
-        ws = sh.worksheet(LOG_SHEET_NAME)
-    except gspread.WorksheetNotFound:
-        ws = sh.add_worksheet(title=LOG_SHEET_NAME, rows=2000, cols=10)
+    ws = get_or_create_worksheet(sh, LOG_SHEET_NAME, rows=2000, cols=10)
+    if len(ws.get_all_values()) == 0:
         ws.append_row(LOG_HEADERS, value_input_option="USER_ENTERED", table_range="A1")
 
     ws.append_row(
@@ -119,6 +117,23 @@ def push_to_log(sh, date_str: str, time_str: str, workflow_name: str, trigger_la
         value_input_option="USER_ENTERED",
         table_range="A1",
     )
+
+
+def get_or_create_worksheet(sh, title: str, rows: int, cols: int):
+    """
+    หาแท็บด้วยชื่อ (ตัดช่องว่างหัวท้ายออกก่อนเทียบ) ถ้าไม่เจอค่อยสร้างใหม่
+
+    ใช้แทน sh.worksheet(title) ตรง ๆ เพราะเจอบั๊กที่ gspread หาแท็บที่มีอยู่
+    จริงไม่เจอ (อาจเกิดจากช่องว่างแฝง/อักขระที่มองไม่เห็นต่างกันเล็กน้อยใน
+    ชื่อแท็บจริงบน Google Sheets) แล้วพยายามสร้างแท็บใหม่ซ้ำ ทำให้ชนกับของเดิม
+    และเกิด APIError "sheet with the name already exists" ทั้งที่จริง ๆ มีแท็บ
+    นั้นอยู่แล้ว วิธีนี้ทนทานกว่าเพราะดึงรายชื่อแท็บทั้งหมดมาเทียบเองแบบ
+    normalize ก่อน ไม่พึ่งพา exact-match lookup ของ gspread ตรง ๆ
+    """
+    for ws in sh.worksheets():
+        if ws.title.strip() == title.strip():
+            return ws
+    return sh.add_worksheet(title=title, rows=rows, cols=cols)
 
 
 def sync_once():
@@ -169,13 +184,11 @@ def sync_once():
 
     try:
         target_sh = get_open_spreadsheet("TARGET_GSHEET_ID")
-        try:
-            target_ws = target_sh.worksheet(TARGET_SHEET_NAME)
-            target_ws.clear()
-        except gspread.WorksheetNotFound:
-            target_ws = target_sh.add_worksheet(
-                title=TARGET_SHEET_NAME, rows=len(transformed_rows) + 100, cols=len(header) + 2
-            )
+        target_ws = get_or_create_worksheet(
+            target_sh, TARGET_SHEET_NAME,
+            rows=len(transformed_rows) + 100, cols=len(header) + 2,
+        )
+        target_ws.clear()
 
         all_rows_to_write = [header] + transformed_rows
         target_ws.update(all_rows_to_write, value_input_option="USER_ENTERED")
