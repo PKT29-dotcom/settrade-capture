@@ -31,6 +31,7 @@ Environment variables ที่ต้องตั้ง (เพิ่มจา�
 """
 
 import os
+import re
 import sys
 import traceback
 import datetime as dt
@@ -121,19 +122,44 @@ def push_to_log(sh, date_str: str, time_str: str, workflow_name: str, trigger_la
 
 def get_or_create_worksheet(sh, title: str, rows: int, cols: int):
     """
-    หาแท็บด้วยชื่อ (ตัดช่องว่างหัวท้ายออกก่อนเทียบ) ถ้าไม่เจอค่อยสร้างใหม่
+    หาแท็บด้วยชื่อ (normalize แบบเข้มงวด ตัดทุกอักขระที่ไม่ใช่ตัวอักษร/ตัวเลข
+    ออกก่อนเทียบ) ถ้าไม่เจอค่อยสร้างใหม่ พร้อม fallback ดักจับ error กรณี
+    Google บอกว่ามีแท็บชื่อนี้อยู่แล้วจริง แต่ list ที่ดึงมาหาไม่เจอ
 
-    ใช้แทน sh.worksheet(title) ตรง ๆ เพราะเจอบั๊กที่ gspread หาแท็บที่มีอยู่
-    จริงไม่เจอ (อาจเกิดจากช่องว่างแฝง/อักขระที่มองไม่เห็นต่างกันเล็กน้อยใน
-    ชื่อแท็บจริงบน Google Sheets) แล้วพยายามสร้างแท็บใหม่ซ้ำ ทำให้ชนกับของเดิม
-    และเกิด APIError "sheet with the name already exists" ทั้งที่จริง ๆ มีแท็บ
-    นั้นอยู่แล้ว วิธีนี้ทนทานกว่าเพราะดึงรายชื่อแท็บทั้งหมดมาเทียบเองแบบ
-    normalize ก่อน ไม่พึ่งพา exact-match lookup ของ gspread ตรง ๆ
+    เจอปัญหาว่า sh.worksheets() (ซึ่งดึงข้อมูลสดจาก API ทุกครั้ง ไม่ได้ cache)
+    ยังหาแท็บที่มีอยู่จริงไม่เจอ แม้จะ .strip() ช่องว่างหัวท้ายแล้ว คาดว่าชื่อ
+    แท็บจริงบน Google Sheets มีอักขระที่มองไม่เห็นแบบอื่น (เช่น zero-width
+    space) ปนอยู่ ซึ่ง .strip() ธรรมดาดักไม่ได้ จึง normalize แบบเข้มงวดกว่า
+    เดิม (ตัดทุกอักขระที่ไม่ใช่ a-z0-9 ออกให้หมด ไม่สนตัวพิมพ์เล็ก-ใหญ่) และ
+    เผื่อไว้อีกชั้นด้วยการดักจับ APIError "already exists" จาก add_worksheet
+    แล้วลองค้นหาซ้ำอีกครั้งก่อนจะยอม raise error จริง ๆ
     """
-    for ws in sh.worksheets():
-        if ws.title.strip() == title.strip():
-            return ws
-    return sh.add_worksheet(title=title, rows=rows, cols=cols)
+    def _normalize(s: str) -> str:
+        return re.sub(r"[^a-zA-Z0-9]", "", s).lower()
+
+    target_key = _normalize(title)
+
+    def _find_match():
+        for ws in sh.worksheets():
+            if _normalize(ws.title) == target_key:
+                return ws
+        return None
+
+    match = _find_match()
+    if match:
+        return match
+
+    try:
+        return sh.add_worksheet(title=title, rows=rows, cols=cols)
+    except gspread.exceptions.APIError as e:
+        if "already exists" not in str(e):
+            raise
+        # Google ยืนยันว่ามีแท็บนี้อยู่แล้วจริง แต่ list ก่อนหน้าหาไม่เจอ
+        # ลองดึง list ใหม่อีกรอบก่อนยอมแพ้จริง ๆ
+        match = _find_match()
+        if match:
+            return match
+        raise
 
 
 def sync_once():
