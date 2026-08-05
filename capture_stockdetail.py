@@ -7,9 +7,13 @@ StockDetailDaily ใน Google Sheet "Settrade Capture Log"
 
 capture วันละครั้ง (เหมือน SetDatabase/SectorIndex) รันหลังตลาดปิดสนิทแล้ว
 
-URL pattern (ยืนยันจากการสำรวจแล้ว):
-    https://www.set.or.th/th/market/index/{market}/{group}/{sector}
-    เช่น .../set/consump/fashion, .../set/service/comm, .../mai/consump/fashion
+URL pattern (ยืนยันจากการทดสอบจริงแล้ว - โครงสร้าง SET กับ mai ต่างกัน):
+    SET (3 ระดับ, ต้องระบุทั้ง Group และ Sector):
+        https://www.set.or.th/th/market/index/set/{group}/{sector}
+        เช่น .../set/consump/fashion, .../set/service/comm
+    mai (2 ระดับ, ไม่มี Sector ย่อย ใช้แค่ Group):
+        https://www.set.or.th/th/market/index/mai/{group}
+        เช่น .../mai/agro, .../mai/consump
 
 ออกแบบให้ทนทานต่อความผิดพลาดรายหน้า: ถ้าหมวดย่อยไหนของตลาดไหนไม่มีข้อมูล
 (เช่น mai ไม่มีหุ้นในหมวดนั้นเลย) หรือโหลดไม่สำเร็จ จะข้ามไปหน้าถัดไปแทนที่จะ
@@ -35,7 +39,6 @@ from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeo
 BANGKOK_TZ = ZoneInfo("Asia/Bangkok")
 
 BASE_URL = "https://www.set.or.th/th/market/index"
-MARKETS = ["set", "mai"]
 
 # แผนที่ว่าแต่ละหมวดธุรกิจย่อย (Sector) อยู่ในกลุ่มอุตสาหกรรมใหญ่ (Group) ไหน
 # (ชุดเดียวกับที่ใช้ใน capture_sectorindex.py)
@@ -219,8 +222,20 @@ def extract_stock_rows(page, market_label, group_code, sector_code, known_symbol
     return rows_out
 
 
+GROUP_CODES = sorted(set(SECTOR_TO_GROUP.values()))  # 8 กลุ่มใหญ่ (ไม่ซ้ำ)
+
+
 def fetch_all_stock_details(known_symbols):
-    """เปิดทีละหน้า (28 หมวดย่อย x 2 ตลาด) ดึงข้อมูลหุ้นรายตัวทั้งหมด"""
+    """
+    เปิดทีละหน้าดึงข้อมูลหุ้นรายตัวทั้งหมด
+
+    โครงสร้างหน้าเว็บของ SET กับ mai ต่างกัน:
+      - SET: มี 3 ระดับ Group -> Sector -> หุ้นรายตัว ต้องเข้า URL ระดับ Sector
+        (เช่น set/consump/fashion) ถึงจะเห็นตารางหุ้นแบบไม่ย่อ (28 หมวดย่อย)
+      - mai: มีแค่ 2 ระดับ Group -> หุ้นรายตัว ไม่มีระดับ Sector ย่อยเลย
+        (เช่น mai/agro เจอตารางหุ้นเต็มทันที ไม่ต้องมี sub-path ต่อท้าย)
+        ใช้แค่ 8 กลุ่มใหญ่ ไม่ใช่ 28 หมวดย่อยเหมือน SET
+    """
     all_rows = []
     sector_items = list(SECTOR_TO_GROUP.items())
 
@@ -228,29 +243,45 @@ def fetch_all_stock_details(known_symbols):
         browser = p.chromium.launch(headless=True)
         page = browser.new_page(viewport={"width": 1600, "height": 3000})
         try:
-            for market in MARKETS:
-                for sector_code, group_code in sector_items:
-                    success = False
-                    for slug in slug_candidates(sector_code):
-                        url = f"{BASE_URL}/{market}/{group_code.lower()}/{slug}"
-                        try:
-                            page.goto(url, wait_until="domcontentloaded", timeout=30000)
-                            page.wait_for_selector("table", timeout=10000)
-                            page.wait_for_timeout(1500)
-                        except PlaywrightTimeoutError:
-                            continue  # ลอง slug ถัดไป หรือข้ามถ้าหมดแล้ว
+            # ----- SET: 28 หมวดย่อย (Group/Sector) -----
+            for sector_code, group_code in sector_items:
+                success = False
+                for slug in slug_candidates(sector_code):
+                    url = f"{BASE_URL}/set/{group_code.lower()}/{slug}"
+                    try:
+                        page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                        page.wait_for_selector("table", timeout=10000)
+                        page.wait_for_timeout(1500)
+                    except PlaywrightTimeoutError:
+                        continue
 
-                        rows = extract_stock_rows(page, market, group_code, sector_code, known_symbols)
-                        if rows:
-                            all_rows.extend(rows)
-                            print(f"    [{market.upper()}] {group_code}/{sector_code}: "
-                                  f"ได้ {len(rows)} หุ้น")
-                            success = True
-                            break
+                    rows = extract_stock_rows(page, "set", group_code, sector_code, known_symbols)
+                    if rows:
+                        all_rows.extend(rows)
+                        print(f"    [SET] {group_code}/{sector_code}: ได้ {len(rows)} หุ้น")
+                        success = True
+                        break
 
-                    if not success:
-                        print(f"    [{market.upper()}] {group_code}/{sector_code}: "
-                              "ไม่พบข้อมูลหุ้น (ข้ามไป)")
+                if not success:
+                    print(f"    [SET] {group_code}/{sector_code}: ไม่พบข้อมูลหุ้น (ข้ามไป)")
+
+            # ----- mai: แค่ 8 กลุ่มใหญ่ (ไม่มีระดับ Sector ย่อย) -----
+            for group_code in GROUP_CODES:
+                url = f"{BASE_URL}/mai/{group_code.lower()}"
+                try:
+                    page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                    page.wait_for_selector("table", timeout=10000)
+                    page.wait_for_timeout(1500)
+                except PlaywrightTimeoutError:
+                    print(f"    [MAI] {group_code}: โหลดหน้าไม่สำเร็จ (ข้ามไป)")
+                    continue
+
+                rows = extract_stock_rows(page, "mai", group_code, "", known_symbols)
+                if rows:
+                    all_rows.extend(rows)
+                    print(f"    [MAI] {group_code}: ได้ {len(rows)} หุ้น")
+                else:
+                    print(f"    [MAI] {group_code}: ไม่พบข้อมูลหุ้น (ข้ามไป)")
         finally:
             browser.close()
 
