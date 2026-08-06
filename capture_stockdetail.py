@@ -62,7 +62,7 @@ SYMBOL_SUFFIX_TOKENS = {
 }
 
 STOCKLIST_SHEET_NAME = "StockList"
-STOCKDETAIL_SHEET_NAME = "StockDetailDaily"
+STOCKDETAIL_SHEET_NAME = "StockDailyDetail"
 STOCKDETAIL_HEADERS = [
     "Date", "Market", "Group", "Sector", "Symbol",
     "Open", "High", "Low", "Last", "Chg", "Chg%", "Bid", "Ask",
@@ -125,28 +125,25 @@ def clean_column_name(col) -> str:
 
 
 def clean_symbol(raw_symbol: str, known_symbols=None) -> str:
-    """ตัดตัวย่อท้ายชื่อหุ้นออก เทียบกับ StockList ก่อนตัด กันตัดผิด (เช่น SCB, TACC)"""
+    """
+    ตัดตัวย่อท้ายชื่อหุ้นออก รองรับกรณีมีหลายตัวย่อต่อกัน เช่น "SQ CB CS" -> "SQ"
+
+    ปลอดภัยจากการตัดผิดกรณีหุ้นชื่อลงท้ายด้วยตัวอักษรพวกนี้พอดี (เช่น SCB,
+    TACC, TBSP) เพราะเช็คว่าต้องเป็น "คำแยกต่างหาก" ที่มีช่องว่างคั่นเท่านั้น
+    ถึงจะตัด ไม่ได้เช็คแค่ตัวอักษรท้ายสตริงเฉย ๆ - SCB เป็นคำเดียวไม่มีช่องว่าง
+    เลยไม่ถูกตัดเลย ในขณะที่ "SQ CB CS" แยกเป็น 3 คำ ตัดวนไปทีละคำจนกว่าจะ
+    ไม่เจอ badge ต่อท้ายแล้ว (รองรับ badge ซ้อนกันกี่ตัวก็ได้ ไม่จำกัด)
+    """
     s = str(raw_symbol).strip().upper()
-    if known_symbols and s in known_symbols:
-        return s
     parts = s.split()
     while len(parts) > 1 and parts[-1] in SYMBOL_SUFFIX_TOKENS:
-        candidate = " ".join(parts[:-1])
-        if not known_symbols or candidate in known_symbols:
-            parts = parts[:-1]
-        else:
-            break
+        parts = parts[:-1]
     return " ".join(parts).strip()
 
 
 def _dash_to_zero(val):
     s = str(val).strip()
     return "0" if s in ("-", "", "nan", "NaN") else val
-
-
-def _dash_to_blank(val):
-    s = str(val).strip()
-    return "" if s in ("-", "nan", "NaN") else val
 
 
 def load_stocklist_symbols(sh):
@@ -193,25 +190,25 @@ def extract_stock_rows(page, market_label, group_code, sector_code, known_symbol
                     if "หลักทรัพย์" in col_name:
                         fields["Symbol"] = clean_symbol(val, known_symbols)
                     elif "เปิด" in col_name:
-                        fields["Open"] = _dash_to_blank(val)
+                        fields["Open"] = _dash_to_zero(val)
                     elif "สูงสุด" in col_name:
-                        fields["High"] = _dash_to_blank(val)
+                        fields["High"] = _dash_to_zero(val)
                     elif "ต่ำสุด" in col_name:
-                        fields["Low"] = _dash_to_blank(val)
+                        fields["Low"] = _dash_to_zero(val)
                     elif "ล่าสุด" in col_name:
-                        fields["Last"] = _dash_to_blank(val)
+                        fields["Last"] = _dash_to_zero(val)
                     elif "เปลี่ยนแปลง" in col_name and "%" in col_name:
                         fields["ChgPct"] = _dash_to_zero(val)
                     elif "เปลี่ยนแปลง" in col_name:
                         fields["Chg"] = _dash_to_zero(val)
                     elif "เสนอซื้อ" in col_name:
-                        fields["Bid"] = _dash_to_blank(val)
+                        fields["Bid"] = _dash_to_zero(val)
                     elif "เสนอขาย" in col_name:
-                        fields["Ask"] = _dash_to_blank(val)
+                        fields["Ask"] = _dash_to_zero(val)
                     elif "ปริมาณ" in col_name:
-                        fields["Volume"] = _dash_to_blank(val)
+                        fields["Volume"] = _dash_to_zero(val)
                     elif "มูลค่า" in col_name:
-                        fields["Value"] = _dash_to_blank(val)
+                        fields["Value"] = _dash_to_zero(val)
 
                 if not fields["Symbol"]:
                     continue
@@ -276,7 +273,7 @@ def fetch_all_stock_details(known_symbols):
                     print(f"    [MAI] {group_code}: โหลดหน้าไม่สำเร็จ (ข้ามไป)")
                     continue
 
-                rows = extract_stock_rows(page, "mai", group_code, "", known_symbols)
+                rows = extract_stock_rows(page, "mai", group_code, "N/A", known_symbols)
                 if rows:
                     all_rows.extend(rows)
                     print(f"    [MAI] {group_code}: ได้ {len(rows)} หุ้น")
@@ -308,17 +305,32 @@ def push_to_stockdetail(sh, all_rows, date_str: str, trigger_label: str):
         ws = sh.add_worksheet(title=STOCKDETAIL_SHEET_NAME, rows=len(all_rows) + 500, cols=20)
         ws.append_row(STOCKDETAIL_HEADERS, value_input_option="USER_ENTERED", table_range="A1")
 
+    existing_row_count = len(ws.get_all_values())
+    start_row = existing_row_count + 1
+
+    symbol_col_index = STOCKDETAIL_HEADERS.index("Symbol") + 1  # 1-based
+    symbol_col_letter = gspread.utils.rowcol_to_a1(1, symbol_col_index).rstrip("0123456789")
+
     rows_to_append = []
     for r in all_rows:
+        row_num = start_row + len(rows_to_append)
+        # ใช้ VLOOKUP อ้างอิงแท็บ StockList แทนค่า Sector เดิม (ที่ได้จาก
+        # โครงสร้างหน้าเว็บ) เพื่อให้ Sector มาจากแหล่งเดียวกันทั้งไฟล์ (เหมือน
+        # ที่ TopDatabase ทำ) และแก้ปัญหา mai ที่ไม่มีข้อมูล Sector จริงจาก
+        # set.or.th (เคยเป็น N/A) ให้ได้ค่าจริงจาก StockList แทน
+        sector_formula = (
+            f'=IFERROR(VLOOKUP({symbol_col_letter}{row_num},'
+            f'{STOCKLIST_SHEET_NAME}!A:B,2,FALSE),"")'
+        )
         rows_to_append.append([
-            date_str, r["Market"], r["Group"], r["Sector"], r["Symbol"],
+            date_str, r["Market"], r["Group"], sector_formula, r["Symbol"],
             r["Open"], r["High"], r["Low"], r["Last"], r["Chg"], r["ChgPct"],
             r["Bid"], r["Ask"], r["Volume"], r["Value"],
             trigger_label,
         ])
 
     if not rows_to_append:
-        print("  ไม่มีแถวข้อมูลจะส่งเข้า StockDetailDaily")
+        print("  ไม่มีแถวข้อมูลจะส่งเข้า StockDailyDetail")
         return 0
 
     ws.append_rows(rows_to_append, value_input_option="USER_ENTERED", table_range="A1")
