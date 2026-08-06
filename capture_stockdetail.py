@@ -64,7 +64,7 @@ SYMBOL_SUFFIX_TOKENS = {
 STOCKLIST_SHEET_NAME = "StockList"
 STOCKDETAIL_SHEET_NAME = "StockDailyDetail"
 STOCKDETAIL_HEADERS = [
-    "Date", "Market", "Group", "Sector", "Symbol",
+    "Date", "Time", "Market", "Group", "Sector", "Symbol",
     "Open", "High", "Low", "Last", "Chg", "Chg%", "Bid", "Ask",
     "Volume", "Value", "Trigger",
 ]
@@ -298,7 +298,7 @@ def get_open_spreadsheet():
     return gc.open_by_key(sheet_id)
 
 
-def push_to_stockdetail(sh, all_rows, date_str: str, trigger_label: str):
+def push_to_stockdetail(sh, all_rows, date_str: str, time_str: str, trigger_label: str):
     try:
         ws = sh.worksheet(STOCKDETAIL_SHEET_NAME)
     except gspread.WorksheetNotFound:
@@ -323,7 +323,7 @@ def push_to_stockdetail(sh, all_rows, date_str: str, trigger_label: str):
             f'{STOCKLIST_SHEET_NAME}!A:B,2,FALSE),"")'
         )
         rows_to_append.append([
-            date_str, r["Market"], r["Group"], sector_formula, r["Symbol"],
+            date_str, time_str, r["Market"], r["Group"], sector_formula, r["Symbol"],
             r["Open"], r["High"], r["Low"], r["Last"], r["Chg"], r["ChgPct"],
             r["Bid"], r["Ask"], r["Volume"], r["Value"],
             trigger_label,
@@ -384,7 +384,7 @@ def capture_once():
 
     print(f"  พบข้อมูลหุ้นรวม {len(all_rows)} แถว กำลังส่งเข้า Google Sheet...")
     try:
-        rows_sent = push_to_stockdetail(sh, all_rows, date_str, trigger_label)
+        rows_sent = push_to_stockdetail(sh, all_rows, date_str, time_str, trigger_label)
     except Exception as e:
         detail = f"{type(e).__name__}: {str(e)[:200]}"
         push_to_log(sh, date_str, time_str, workflow_name, trigger_label, "Failed", 0, detail)
