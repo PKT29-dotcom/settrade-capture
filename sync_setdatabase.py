@@ -2,7 +2,7 @@
 sync_setdatabase.py
 ---------------------
 Copy ข้อมูลจากแท็บ SetDatabase ในชีท "Settrade Capture Log" (ต้นทาง) ไปวางที่
-แท็บ SetDatabase ในชีทของอีก Google Account (ปลายทาง) - ชื่อแท็บเดียวกันทั้ง
+แท็บ "SetDatabase schedule" ในชีทของอีก Google Account (ปลายทาง)
 ต้นทางและปลายทาง
 
 "เขียนทับทั้งหมดทุกครั้ง" (ไม่ append) - ลบข้อมูลเดิมในแท็บปลายทางออกก่อน
@@ -40,7 +40,7 @@ from google.oauth2.service_account import Credentials
 BANGKOK_TZ = ZoneInfo("Asia/Bangkok")
 
 SOURCE_SHEET_NAME = "SetDatabase"
-TARGET_SHEET_NAME = "SetDatabase"
+TARGET_SHEET_NAME = "SetDatabase schedule"
 
 LOG_SHEET_NAME = "Log"
 LOG_HEADERS = ["Date", "Time", "Workflow", "Trigger", "Status", "RowsSent", "Detail"]
