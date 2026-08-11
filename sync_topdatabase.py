@@ -10,11 +10,14 @@ Copy ข้อมูลจากแท็บ TopDatabase ในชีท "Settra
    15:00, 16:30) ที่ใกล้ที่สุด เพราะเวลาจริงที่ capture ได้อาจคลาดเคลื่อนจาก
    ที่ตั้งไว้ (เช่น GitHub Actions delay ทำให้ได้ 10:50 แทนที่จะเป็น 10:30)
    แต่ชีทปลายทางมี dropdown/filter ที่ต้องการค่าตรงกับ 4 ช่วงนี้เป๊ะ
+3. "ตัดข้อมูลซ้ำ" หลังปัดเวลาแล้ว ถ้าวันเดียวกัน มีมากกว่า 1 ครั้งที่ปัดตกลง
+   slot เดียวกัน (เช่น รอบ Scheduled ที่ล่าช้า + รอบ Manual ที่กดช่วยเสริม
+   ในวันเดียวกัน ทั้งคู่ปัดเข้า 16:30 เหมือนกัน) จะเก็บไว้แค่ชุดล่าสุด ไม่ให้
+   ข้อมูลซ้ำซ้อนไปที่ปลายทาง (คีย์เทียบ: Date+Time+Index+TopType+Rank+Symbol)
 
-   หมายเหตุ: การปัดเวลานี้มีผลเฉพาะข้อมูลที่ส่งไปให้ชีทปลายทางเท่านั้น
-   ไม่ได้แก้ไขค่า Time จริงในชีทต้นทาง (Settrade Capture Log) เพื่อให้ยังคง
-   เห็นเวลา capture จริงไว้สำหรับตรวจสอบ/วิเคราะห์ (เหมือนที่เคยทำเรื่อง
-   Log ไว้ก่อนหน้านี้)
+   หมายเหตุ: การปัดเวลา/ตัดซ้ำนี้มีผลเฉพาะข้อมูลที่ส่งไปให้ชีทปลายทางเท่านั้น
+   ไม่ได้แก้ไข/ลบข้อมูลจริงในชีทต้นทาง (Settrade Capture Log) เพื่อให้ยังคง
+   เห็นประวัติการรันทุกครั้งไว้สำหรับตรวจสอบ/วิเคราะห์
 
 Environment variables ที่ต้องตั้ง (เพิ่มจากที่มีอยู่เดิม):
     GSHEET_ID                      -> ID ของ Google Sheet ต้นทาง (ของเราเอง)
@@ -51,6 +54,9 @@ LOG_HEADERS = ["Date", "Time", "Workflow", "Trigger", "Status", "RowsSent", "Det
 # 4 ช่วงเวลาที่ต้องการให้ผลลัพธ์ตรงเป๊ะ (นาทีนับจากเที่ยงคืน ไว้คำนวณระยะห่าง)
 CANONICAL_SLOTS = ["10:30", "12:30", "15:00", "16:30"]
 
+# คีย์ที่ใช้เทียบว่าแถวไหนคือ "สล็อตเดียวกัน" ของวันเดียวกัน (ไว้ตัดซ้ำ)
+DEDUP_KEY_COLUMNS = ["Date", "Time", "Index", "TopType", "Rank", "Symbol"]
+
 
 def _time_to_minutes(time_str: str):
     """แปลง 'HH:MM' เป็นจำนวนนาทีนับจากเที่ยงคืน คืน None ถ้า parse ไม่ได้"""
@@ -76,6 +82,33 @@ def snap_to_nearest_slot(time_str: str) -> str:
 
     best_slot = min(_CANONICAL_MINUTES, key=lambda pair: abs(pair[0] - minutes))
     return best_slot[1]
+
+
+def dedup_rows(header, rows):
+    """
+    ตัดแถวที่ซ้ำกันหลังปัดเวลาแล้ว โดยเทียบคีย์ DEDUP_KEY_COLUMNS เก็บไว้แค่
+    แถวล่าสุด (ตัวท้ายสุดที่เจอ) ต่อ 1 คีย์ เพราะ TopDatabase ต้นทางเรียงตาม
+    ลำดับเวลาที่ capture จริง แถวที่มาทีหลังคือข้อมูลใหม่กว่าเสมอ
+
+    ถ้าหาคอลัมน์ที่ต้องใช้ทำคีย์ไม่ครบ (โครงสร้างเปลี่ยนไปจากที่คาด) จะข้าม
+    การตัดซ้ำไปเลย คืนค่า rows เดิมกลับไปแทน เพื่อไม่ให้ sync ทั้งหมดล้มเหลว
+    """
+    try:
+        col_indices = [header.index(c) for c in DEDUP_KEY_COLUMNS]
+    except ValueError as e:
+        print(f"  คำเตือน: หาคอลัมน์สำหรับตัดซ้ำไม่ครบ ({e}) -> ข้ามการตัดซ้ำรอบนี้")
+        return rows
+
+    deduped = {}
+    for row in rows:
+        key = tuple(row[i] if i < len(row) else "" for i in col_indices)
+        deduped[key] = row  # แถวหลังทับแถวก่อน -> เก็บแถวล่าสุดของแต่ละคีย์ไว้
+
+    removed = len(rows) - len(deduped)
+    if removed > 0:
+        print(f"  ตัดแถวซ้ำออก {removed} แถว (สล็อตเวลาเดียวกันถูก capture มากกว่า 1 ครั้ง)")
+
+    return list(deduped.values())
 
 
 def get_open_spreadsheet(sheet_id_env: str):
@@ -107,32 +140,11 @@ def get_workflow_name() -> str:
     return os.environ.get("GITHUB_WORKFLOW", "local")
 
 
-def push_to_log(sh, date_str: str, time_str: str, workflow_name: str, trigger_label: str,
-                 status: str, rows_sent, detail: str = ""):
-    ws = get_or_create_worksheet(sh, LOG_SHEET_NAME, rows=2000, cols=10)
-    if len(ws.get_all_values()) == 0:
-        ws.append_row(LOG_HEADERS, value_input_option="USER_ENTERED", table_range="A1")
-
-    ws.append_row(
-        [date_str, time_str, workflow_name, trigger_label, status, rows_sent, detail],
-        value_input_option="USER_ENTERED",
-        table_range="A1",
-    )
-
-
 def get_or_create_worksheet(sh, title: str, rows: int, cols: int):
     """
     หาแท็บด้วยชื่อ (normalize แบบเข้มงวด ตัดทุกอักขระที่ไม่ใช่ตัวอักษร/ตัวเลข
     ออกก่อนเทียบ) ถ้าไม่เจอค่อยสร้างใหม่ พร้อม fallback ดักจับ error กรณี
     Google บอกว่ามีแท็บชื่อนี้อยู่แล้วจริง แต่ list ที่ดึงมาหาไม่เจอ
-
-    เจอปัญหาว่า sh.worksheets() (ซึ่งดึงข้อมูลสดจาก API ทุกครั้ง ไม่ได้ cache)
-    ยังหาแท็บที่มีอยู่จริงไม่เจอ แม้จะ .strip() ช่องว่างหัวท้ายแล้ว คาดว่าชื่อ
-    แท็บจริงบน Google Sheets มีอักขระที่มองไม่เห็นแบบอื่น (เช่น zero-width
-    space) ปนอยู่ ซึ่ง .strip() ธรรมดาดักไม่ได้ จึง normalize แบบเข้มงวดกว่า
-    เดิม (ตัดทุกอักขระที่ไม่ใช่ a-z0-9 ออกให้หมด ไม่สนตัวพิมพ์เล็ก-ใหญ่) และ
-    เผื่อไว้อีกชั้นด้วยการดักจับ APIError "already exists" จาก add_worksheet
-    แล้วลองค้นหาซ้ำอีกครั้งก่อนจะยอม raise error จริง ๆ
     """
     def _normalize(s: str) -> str:
         return re.sub(r"[^a-zA-Z0-9]", "", s).lower()
@@ -154,12 +166,23 @@ def get_or_create_worksheet(sh, title: str, rows: int, cols: int):
     except gspread.exceptions.APIError as e:
         if "already exists" not in str(e):
             raise
-        # Google ยืนยันว่ามีแท็บนี้อยู่แล้วจริง แต่ list ก่อนหน้าหาไม่เจอ
-        # ลองดึง list ใหม่อีกรอบก่อนยอมแพ้จริง ๆ
         match = _find_match()
         if match:
             return match
         raise
+
+
+def push_to_log(sh, date_str: str, time_str: str, workflow_name: str, trigger_label: str,
+                 status: str, rows_sent, detail: str = ""):
+    ws = get_or_create_worksheet(sh, LOG_SHEET_NAME, rows=2000, cols=10)
+    if len(ws.get_all_values()) == 0:
+        ws.append_row(LOG_HEADERS, value_input_option="USER_ENTERED", table_range="A1")
+
+    ws.append_row(
+        [date_str, time_str, workflow_name, trigger_label, status, rows_sent, detail],
+        value_input_option="USER_ENTERED",
+        table_range="A1",
+    )
 
 
 def sync_once():
@@ -206,7 +229,11 @@ def sync_once():
             row[time_col_index] = snap_to_nearest_slot(row[time_col_index])
         transformed_rows.append(row)
 
-    print(f"  พบ {len(transformed_rows)} แถวจากต้นทาง กำลังส่งไปยังชีทปลายทาง ...")
+    # ตัดแถวซ้ำที่เกิดจากหลายรอบ capture ปัดตกลง slot เดียวกันในวันเดียวกัน
+    # (เช่น Scheduled ล่าช้า + Manual ที่กดช่วยเสริม)
+    transformed_rows = dedup_rows(header, transformed_rows)
+
+    print(f"  พบ {len(transformed_rows)} แถวหลังตัดซ้ำ กำลังส่งไปยังชีทปลายทาง ...")
 
     try:
         target_sh = get_open_spreadsheet("TARGET_GSHEET_ID")
