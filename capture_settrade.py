@@ -59,6 +59,8 @@ import gspread
 from google.oauth2.service_account import Credentials
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
+from market_holidays import is_market_holiday
+
 BANGKOK_TZ = ZoneInfo("Asia/Bangkok")
 
 BASE_URL = "https://www.settrade.com/th/equities/market-summary/top-ranking/overview"
@@ -361,7 +363,7 @@ def push_to_master(sh, results, date_str: str, time_str: str, trigger_label: str
         ws = sh.worksheet(MASTER_SHEET_NAME)
     except gspread.WorksheetNotFound:
         ws = sh.add_worksheet(title=MASTER_SHEET_NAME, rows=2000, cols=15)
-        ws.append_row(MASTER_HEADERS, value_input_option="USER_ENTERED")
+        ws.append_row(MASTER_HEADERS, value_input_option="USER_ENTERED", table_range="A1")
 
     existing_row_count = len(ws.get_all_values())
     start_row = existing_row_count + 1
@@ -399,7 +401,7 @@ def push_to_master(sh, results, date_str: str, time_str: str, trigger_label: str
         print("  ไม่มีแถวข้อมูลจะส่งเข้า Master")
         return
 
-    ws.append_rows(rows_to_append, value_input_option="USER_ENTERED")
+    ws.append_rows(rows_to_append, value_input_option="USER_ENTERED", table_range="A1")
     print(f"  ส่ง {len(rows_to_append)} แถว เข้า worksheet '{MASTER_SHEET_NAME}'")
 
 
@@ -426,11 +428,12 @@ def push_to_log(sh, date_str: str, time_str: str, workflow_name: str, trigger_la
         ws = sh.worksheet(LOG_SHEET_NAME)
     except gspread.WorksheetNotFound:
         ws = sh.add_worksheet(title=LOG_SHEET_NAME, rows=2000, cols=10)
-        ws.append_row(LOG_HEADERS, value_input_option="USER_ENTERED")
+        ws.append_row(LOG_HEADERS, value_input_option="USER_ENTERED", table_range="A1")
 
     ws.append_row(
         [date_str, time_str, workflow_name, trigger_label, status, rows_sent, detail],
         value_input_option="USER_ENTERED",
+        table_range="A1",
     )
 
 
@@ -475,11 +478,19 @@ def capture_once():
     time_str = now.strftime("%H:%M")
     trigger_label = get_trigger_label()
     workflow_name = get_workflow_name()
+
+    # เปิด Google Sheet ก่อน เพื่อให้บันทึก Log ได้ไม่ว่าผลจะเป็นแบบไหน
+    sh = get_open_spreadsheet()
+
+    if is_market_holiday(now.date()):
+        print(f"[{date_str} {time_str} เวลาไทย] วันนี้เป็นวันหยุดตลาดหลักทรัพย์ "
+              "-> ข้าม capture รอบนี้ (กันข้อมูลราคาปิดวันก่อนซ้ำเข้าไป)")
+        push_to_log(sh, date_str, time_str, workflow_name, trigger_label, "MarketClosed", 0,
+                    "วันหยุดตลาดหลักทรัพย์ (เสาร์-อาทิตย์ หรือวันหยุดนักขัตฤกษ์ตามปฏิทิน SET)")
+        return
+
     print(f"[{date_str} {time_str} เวลาไทย] เริ่ม capture ข้อมูลจาก {BASE_URL} "
           f"(workflow: {workflow_name}, trigger: {trigger_label})")
-
-    # เปิด Google Sheet ก่อน เพื่อให้บันทึก Log ได้แม้ขั้นตอนถัดไปจะล้มเหลว
-    sh = get_open_spreadsheet()
 
     try:
         results = fetch_all_tables()
