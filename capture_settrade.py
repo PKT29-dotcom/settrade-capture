@@ -94,67 +94,6 @@ MASTER_HEADERS = [
     "Sector", "Volume", "Value", "Last", "Chg", "Chg%", "Trigger",
 ]
 
-# 4 ช่วงเวลาที่ capture ต้องการให้ตรงเป๊ะ (ใช้ตรรกะเดียวกับ sync_topdatabase.py)
-# ก่อน capture จริงจะเช็คก่อนว่าวันนี้มีข้อมูลของ slot เวลานี้ (ปัดเข้าใกล้ที่สุด)
-# อยู่แล้วหรือยัง ถ้ามีแล้ว จะไม่รันซ้ำ กันข้อมูลซ้ำซ้อนกรณีมีการกด Run
-# workflow เองซ้ำใกล้ ๆ กับรอบ Scheduled ที่ทำไปแล้ว (เช่น 16:30 vs 17:57)
-CANONICAL_SLOTS = ["10:30", "12:30", "15:00", "16:30"]
-
-
-def _time_to_minutes(time_str: str):
-    """แปลง 'HH:MM' เป็นจำนวนนาทีนับจากเที่ยงคืน คืน None ถ้า parse ไม่ได้"""
-    try:
-        hh, mm = time_str.strip().split(":")
-        return int(hh) * 60 + int(mm)
-    except (ValueError, AttributeError):
-        return None
-
-
-_CANONICAL_MINUTES = [(_time_to_minutes(s), s) for s in CANONICAL_SLOTS]
-
-
-def snap_to_nearest_slot(time_str: str) -> str:
-    """ปัดเวลาที่ได้จริงให้เข้าใกล้ 1 ใน 4 ช่วงเวลาที่กำหนดที่ใกล้ที่สุด
-    เช่น "17:57" -> "16:30", "10:50" -> "10:30" """
-    minutes = _time_to_minutes(time_str)
-    if minutes is None:
-        return time_str
-    best_slot = min(_CANONICAL_MINUTES, key=lambda pair: abs(pair[0] - minutes))
-    return best_slot[1]
-
-
-def slot_already_captured_today(sh, date_str: str, slot: str) -> bool:
-    """
-    เช็คว่าวันนี้ (date_str) มีข้อมูลของ slot เวลานี้ใน TopDatabase อยู่แล้ว
-    หรือยัง โดยปัดเวลาจริงของทุกแถวที่มีอยู่ให้เข้าใกล้ 1 ใน 4 ช่วงเวลาก่อน
-    เทียบ ถ้าโหลด TopDatabase ไม่สำเร็จ จะคืนค่า False (ไม่บล็อกการ capture
-    เพื่อความปลอดภัย ปล่อยให้รันไปดีกว่าเข้าใจผิดว่าซ้ำแล้วข้ามทั้งที่ไม่ได้ซ้ำ)
-    """
-    try:
-        ws = sh.worksheet(MASTER_SHEET_NAME)
-        all_values = ws.get_all_values()
-    except Exception:
-        return False
-
-    if len(all_values) < 2:
-        return False
-
-    header = all_values[0]
-    try:
-        date_idx = header.index("Date")
-        time_idx = header.index("Time")
-    except ValueError:
-        return False
-
-    for row in all_values[1:]:
-        if len(row) <= max(date_idx, time_idx):
-            continue
-        if row[date_idx] != date_str:
-            continue
-        if snap_to_nearest_slot(row[time_idx]) == slot:
-            return True
-    return False
-
 # แท็บเก็บประวัติการรันทุกครั้ง (แยกจากข้อมูล Master) ไว้ตรวจสอบว่า schedule
 # ทำงานตรงเวลาไหม รอบไหน fail บ้าง เพื่อวิเคราะห์ปัญหาความล่าช้าของ
 # GitHub Actions schedule ได้ง่ายขึ้น
@@ -548,14 +487,6 @@ def capture_once():
               "-> ข้าม capture รอบนี้ (กันข้อมูลราคาปิดวันก่อนซ้ำเข้าไป)")
         push_to_log(sh, date_str, time_str, workflow_name, trigger_label, "MarketClosed", 0,
                     "วันหยุดตลาดหลักทรัพย์ (เสาร์-อาทิตย์ หรือวันหยุดนักขัตฤกษ์ตามปฏิทิน SET)")
-        return
-
-    current_slot = snap_to_nearest_slot(time_str)
-    if slot_already_captured_today(sh, date_str, current_slot):
-        print(f"[{date_str} {time_str} เวลาไทย] วันนี้มีข้อมูลของช่วงเวลา {current_slot} "
-              "อยู่แล้ว -> ข้าม capture รอบนี้ (กันข้อมูลซ้ำ slot เดียวกัน)")
-        push_to_log(sh, date_str, time_str, workflow_name, trigger_label, "SlotAlreadyCaptured", 0,
-                    f"มีข้อมูลของช่วงเวลา {current_slot} ของวันนี้อยู่แล้วใน TopDatabase")
         return
 
     print(f"[{date_str} {time_str} เวลาไทย] เริ่ม capture ข้อมูลจาก {BASE_URL} "
