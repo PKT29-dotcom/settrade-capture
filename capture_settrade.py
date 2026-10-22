@@ -94,6 +94,87 @@ MASTER_HEADERS = [
     "Sector", "Volume", "Value", "Last", "Chg", "Chg%", "Trigger",
 ]
 
+# ช่วงเวลา (Range Time) ของแต่ละรอบ capture
+#   Capture Time   Range Time
+#   10:30          10:30 - 11:30
+#   12:30          12:30 - 14:00
+#   15:00          15:00 - 16:00
+#   16:30          16:30 - 23:00
+# รันได้เฉพาะตอนที่เวลาปัจจุบันอยู่ในช่วงใดช่วงหนึ่ง (รวมเวลาเริ่มและเวลาจบ)
+# และถ้าวันนี้มีข้อมูลของรอบนั้นอยู่แล้ว จะไม่รันซ้ำ
+SLOT_RANGES = [
+    ("10:30", "10:30", "11:30"),
+    ("12:30", "12:30", "14:00"),
+    ("15:00", "15:00", "16:00"),
+    ("16:30", "16:30", "23:00"),
+]
+
+# True  = ถ้าเวลาที่รันอยู่นอกทุกช่วง (เช่น 14:54) ไม่ capture และ log ว่า OutOfRange
+# False = นอกช่วงก็ capture ตามปกติ (จัดเข้า slot ที่ใกล้ที่สุดเพื่อเช็คซ้ำ)
+SKIP_OUTSIDE_RANGE = True
+
+# สวิตช์ปิดเช็ควันหยุดตลาดชั่วคราว (ถ้าสงสัยว่าเช็ควันหยุดทำให้ข้ามผิด)
+ENABLE_HOLIDAY_CHECK = True
+
+
+def _time_to_minutes(time_str: str):
+    """แปลง 'HH:MM' เป็นจำนวนนาทีนับจากเที่ยงคืน คืน None ถ้า parse ไม่ได้"""
+    try:
+        hh, mm = time_str.strip().split(":")
+        return int(hh) * 60 + int(mm)
+    except (ValueError, AttributeError):
+        return None
+
+
+def slot_for_time(time_str: str, strict: bool = True):
+    """
+    คืนค่า slot (10:30/12:30/15:00/16:30) ที่เวลานี้อยู่ในช่วง Range Time
+    strict=True  : นอกทุกช่วงคืน None
+    strict=False : นอกทุกช่วงให้ใช้ slot ที่ใกล้ที่สุด (ใช้จัดกลุ่มข้อมูลเก่าที่
+                   capture ไว้ก่อนมีช่วงเวลา)
+    """
+    minutes = _time_to_minutes(time_str)
+    if minutes is None:
+        return None
+    for slot, start, end in SLOT_RANGES:
+        if _time_to_minutes(start) <= minutes <= _time_to_minutes(end):
+            return slot
+    if strict:
+        return None
+    return min(SLOT_RANGES, key=lambda r: abs(_time_to_minutes(r[0]) - minutes))[0]
+
+
+def slot_already_captured_today(sh, date_str: str, slot: str) -> bool:
+    """
+    เช็คว่าวันนี้ (date_str) มีข้อมูลของ slot นี้ใน TopDatabase อยู่แล้วหรือยัง
+    ถ้าโหลด TopDatabase ไม่สำเร็จ จะคืนค่า False (ไม่บล็อกการ capture)
+    """
+    try:
+        ws = sh.worksheet(MASTER_SHEET_NAME)
+        all_values = ws.get_all_values()
+    except Exception:
+        return False
+
+    if len(all_values) < 2:
+        return False
+
+    header = all_values[0]
+    try:
+        date_idx = header.index("Date")
+        time_idx = header.index("Time")
+    except ValueError:
+        return False
+
+    for row in all_values[1:]:
+        if len(row) <= max(date_idx, time_idx):
+            continue
+        if row[date_idx] != date_str:
+            continue
+        if slot_for_time(row[time_idx], strict=False) == slot:
+            return True
+    return False
+
+
 # แท็บเก็บประวัติการรันทุกครั้ง (แยกจากข้อมูล Master) ไว้ตรวจสอบว่า schedule
 # ทำงานตรงเวลาไหม รอบไหน fail บ้าง เพื่อวิเคราะห์ปัญหาความล่าช้าของ
 # GitHub Actions schedule ได้ง่ายขึ้น
@@ -482,11 +563,27 @@ def capture_once():
     # เปิด Google Sheet ก่อน เพื่อให้บันทึก Log ได้ไม่ว่าผลจะเป็นแบบไหน
     sh = get_open_spreadsheet()
 
-    if is_market_holiday(now.date()):
+    if ENABLE_HOLIDAY_CHECK and is_market_holiday(now.date()):
         print(f"[{date_str} {time_str} เวลาไทย] วันนี้เป็นวันหยุดตลาดหลักทรัพย์ "
               "-> ข้าม capture รอบนี้ (กันข้อมูลราคาปิดวันก่อนซ้ำเข้าไป)")
         push_to_log(sh, date_str, time_str, workflow_name, trigger_label, "MarketClosed", 0,
                     "วันหยุดตลาดหลักทรัพย์ (เสาร์-อาทิตย์ หรือวันหยุดนักขัตฤกษ์ตามปฏิทิน SET)")
+        return
+
+    current_slot = slot_for_time(time_str, strict=True)
+    if current_slot is None:
+        if SKIP_OUTSIDE_RANGE:
+            print(f"[{date_str} {time_str} เวลาไทย] เวลานี้อยู่นอกช่วง capture "
+                  "(10:30-11:30, 12:30-14:00, 15:00-16:00, 16:30-23:00) -> ข้ามรอบนี้")
+            push_to_log(sh, date_str, time_str, workflow_name, trigger_label, "OutOfRange", 0,
+                        "เวลาที่รันอยู่นอกช่วง Range Time ของทุกรอบ")
+            return
+        current_slot = slot_for_time(time_str, strict=False)
+    if slot_already_captured_today(sh, date_str, current_slot):
+        print(f"[{date_str} {time_str} เวลาไทย] วันนี้มีข้อมูลของช่วงเวลา {current_slot} "
+              "อยู่แล้ว -> ข้าม capture รอบนี้ (กันข้อมูลซ้ำ slot เดียวกัน)")
+        push_to_log(sh, date_str, time_str, workflow_name, trigger_label, "SlotAlreadyCaptured", 0,
+                    f"มีข้อมูลของช่วงเวลา {current_slot} ของวันนี้อยู่แล้วใน TopDatabase")
         return
 
     print(f"[{date_str} {time_str} เวลาไทย] เริ่ม capture ข้อมูลจาก {BASE_URL} "
