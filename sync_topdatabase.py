@@ -54,6 +54,14 @@ LOG_HEADERS = ["Date", "Time", "Workflow", "Trigger", "Status", "RowsSent", "Det
 # 4 ช่วงเวลาที่ต้องการให้ผลลัพธ์ตรงเป๊ะ (นาทีนับจากเที่ยงคืน ไว้คำนวณระยะห่าง)
 CANONICAL_SLOTS = ["10:30", "12:30", "15:00", "16:30"]
 
+# ช่วงเวลา (Range Time) ของแต่ละรอบ ชุดเดียวกับ capture_settrade.py
+SLOT_RANGES = [
+    ("10:30", "10:30", "11:30"),
+    ("12:30", "12:30", "14:00"),
+    ("15:00", "15:00", "16:00"),
+    ("16:30", "16:30", "23:00"),
+]
+
 # คีย์ที่ใช้เทียบว่าแถวไหนคือ "สล็อตเดียวกัน" ของวันเดียวกัน (ไว้ตัดซ้ำ)
 DEDUP_KEY_COLUMNS = ["Date", "Time", "Index", "TopType", "Rank", "Symbol"]
 
@@ -72,14 +80,17 @@ _CANONICAL_MINUTES = [(_time_to_minutes(s), s) for s in CANONICAL_SLOTS]
 
 def snap_to_nearest_slot(time_str: str) -> str:
     """
-    ปัดเวลาที่ได้จริงให้เข้าใกล้ 1 ใน 4 ช่วงเวลาที่กำหนดที่ใกล้ที่สุด
-    เช่น "10:50" -> "10:30", "12:35" -> "12:30", "14:58" -> "15:00"
-    ถ้า parse เวลาไม่ได้ (ค่าว่าง/ผิดรูปแบบ) คืนค่าเดิมกลับไปโดยไม่แก้
+    จัดเวลาจริงเข้า slot ตาม Range Time (ชุดเดียวกับ capture_settrade.py):
+    10:30-11:30 -> 10:30, 12:30-14:00 -> 12:30, 15:00-16:00 -> 15:00,
+    16:30-23:00 -> 16:30 ถ้าอยู่นอกทุกช่วง (ข้อมูลเก่าที่ capture ไว้ก่อนมี
+    ช่วงเวลา) จะใช้ slot ที่ใกล้ที่สุดเหมือนเดิม ถ้า parse เวลาไม่ได้คืนค่าเดิม
     """
     minutes = _time_to_minutes(time_str)
     if minutes is None:
         return time_str
-
+    for slot, start, end in SLOT_RANGES:
+        if _time_to_minutes(start) <= minutes <= _time_to_minutes(end):
+            return slot
     best_slot = min(_CANONICAL_MINUTES, key=lambda pair: abs(pair[0] - minutes))
     return best_slot[1]
 
