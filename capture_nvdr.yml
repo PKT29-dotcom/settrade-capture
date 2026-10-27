@@ -1,0 +1,42 @@
+name: Capture NVDR Trading By Stock
+
+on:
+  schedule:
+    # ~08:40 น. เวลาไทย = 01:40 UTC ของวันทำการ: เว็บ SET แสดงข้อมูล NVDR ของ
+    # วันทำการก่อนหน้า (ภาพหน้าเว็บตอน 08:22 ยังโชว์ข้อมูลของวันก่อน) จึงได้ข้อมูลที่ครบแล้ว
+    # script ใช้วันที่ "As of" ในไฟล์เป็น Date และข้ามถ้ามีวันที่นั้นแล้ว รันซ้ำได้ปลอดภัย
+    - cron: '40 1 * * 1-5'
+  workflow_dispatch: {}
+
+jobs:
+  capture:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Install Playwright browser
+        run: playwright install --with-deps chromium
+
+      - name: Decode Google service-account credentials
+        run: echo "${{ secrets.GOOGLE_CREDENTIALS_BASE64 }}" | base64 -d > gcp-credentials.json
+
+      - name: Run capture script
+        env:
+          GSHEET_ID: ${{ secrets.GSHEET_ID }}
+          GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/gcp-credentials.json
+        run: python capture_nvdr.py
+
+      - name: Remove credentials file
+        if: always()
+        run: rm -f gcp-credentials.json
