@@ -1,0 +1,45 @@
+name: Purge Old Data
+
+on:
+  schedule:
+    # วันที่ 1 ของทุกเดือน ~08:30 น. เวลาไทย = 01:30 UTC (ลบจริง)
+    - cron: '30 1 1 * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'true = ทดลอง (ไม่ลบจริง แค่รายงาน) / false = ลบจริง'
+        type: choice
+        options: ['true', 'false']
+        default: 'true'
+
+jobs:
+  purge:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Python dependencies
+        run: pip install gspread google-auth
+
+      - name: Decode Google service-account credentials
+        run: echo "${{ secrets.GOOGLE_CREDENTIALS_BASE64 }}" | base64 -d > gcp-credentials.json
+
+      - name: Run purge script
+        env:
+          GSHEET_ID: ${{ secrets.GSHEET_ID }}
+          GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/gcp-credentials.json
+          # รันตามเวลา = ลบจริง / กดรันเอง = ใช้ค่าที่เลือก (ค่าเริ่มต้น true = ทดลอง)
+          DRY_RUN: ${{ github.event_name == 'schedule' && 'false' || (inputs.dry_run || 'true') }}
+        run: python purge_old_data.py
+
+      - name: Remove credentials file
+        if: always()
+        run: rm -f gcp-credentials.json
