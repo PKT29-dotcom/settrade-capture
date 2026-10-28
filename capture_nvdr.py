@@ -1,19 +1,22 @@
 """
-capture_nvdr.py
------------------
+capture_nvdr.py  (เวอร์ชันอ่านตารางจากหน้าเว็บ ไม่ใช้ Export Excel)
+------------------------------------------------------------------
 Capture NVDR Trading by Stock (รายหุ้น) จาก set.or.th แล้ว append เข้าแท็บ
 NVDRTradingByStock ใน Google Sheet "Settrade Capture Log"
 
-วิธีทำงาน:
-1. เปิดหน้า NVDR Trading by Stock แล้วกดปุ่ม "Export Excel" ดาวน์โหลดไฟล์
-   (ไฟล์มีทั้ง Volume (Share) และ Value (Baht) ของทุกหุ้นในไฟล์เดียว)
-2. อ่านวันที่จากข้อความ "As of dd Mon yyyy" ในไฟล์ แล้วใช้เป็นคอลัมน์ Date
-   ของทุกแถว (เป็นวันที่ของข้อมูลจริง ไม่ใช่วันที่ script รัน)
-3. ถ้าแท็บ NVDRTradingByStock มีข้อมูลของวันที่นั้นอยู่แล้ว จะไม่ append ซ้ำ
-   (บันทึก Log ว่า AlreadyCaptured) จึงรันซ้ำกี่รอบก็ได้ และวันหยุดตลาดก็จะ
-   ข้ามเองโดยปริยาย เพราะหน้าเว็บยังโชว์ข้อมูลของวันทำการล่าสุดเดิม
-4. ถ้าหัวตารางในไฟล์ไม่ตรงกับที่คาด (เว็บเปลี่ยนรูปแบบ) จะหยุดและบันทึก Log
-   ว่า Failed แทนที่จะเดาตำแหน่งคอลัมน์ผิดแล้วบันทึกข้อมูลเพี้ยน
+วิธีทำงาน (แนวเดียวกับ capture_settrade.py):
+1. เปิดหน้า NVDR Trading by Stock ด้วย Playwright รอตารางโหลด
+2. หน้าเว็บแสดง Volume กับ Value แยกกันด้วยปุ่มสลับ "Categorized by" จึงอ่าน
+   2 รอบ (Volume แล้วกด Value) แล้วรวมเป็นแถวเดียวต่อหุ้น
+3. ตารางยาวและอาจโหลดแถวทีละช่วงตอนเลื่อน จึงเลื่อนหน้า/ตารางไปเรื่อย ๆ
+   แล้วเก็บแถวสะสมตาม Symbol จนจำนวนหุ้นไม่เพิ่มอีก
+4. ใช้วันที่จากข้อความ "As of dd Mon yyyy" บนหน้า เป็นคอลัมน์ Date ของทุกแถว
+   (วันที่ของข้อมูลจริง ไม่ใช่วันที่ที่ script รัน)
+5. ถ้าแท็บมีข้อมูลของวันที่นั้นอยู่แล้วจะไม่ append ซ้ำ (Log: AlreadyCaptured)
+6. ตรวจความน่าเชื่อถือก่อนบันทึก: ลำดับหัวคอลัมน์ต้องเป็น Buy,Sell,Total,Net,
+   จำนวนหุ้นต้องไม่น้อยผิดปกติ และจำนวนหุ้นของ Volume กับ Value ต้องใกล้เคียงกัน
+   ถ้าไม่ผ่านจะไม่บันทึก และ Log เป็น Failed พร้อมเหตุผล
+7. หน่วยของตัวเลขอ่านจากหัวตาราง (เช่น '000 บาท) และแปลงเป็น หุ้น/บาท ให้อัตโนมัติ
 
 Environment variables:
     GSHEET_ID
@@ -21,7 +24,6 @@ Environment variables:
 """
 
 import os
-import io
 import re
 import sys
 import numbers
@@ -29,15 +31,12 @@ import traceback
 import datetime as dt
 from zoneinfo import ZoneInfo
 
-import pandas as pd
 import gspread
 from google.oauth2.service_account import Credentials
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
 BANGKOK_TZ = ZoneInfo("Asia/Bangkok")
 
-# URL นี้เดาจากหน้าข้างเคียง (.../nvdr/trading-by-sector) ยังไม่ได้ยืนยันกับ
-# หน้าจริง ถ้าเปิดแล้วไม่ใช่หน้านี้ ให้แก้ค่านี้ตัวเดียว
 NVDR_URL = "https://www.set.or.th/th/market/statistics/nvdr/trading-by-stock"
 
 NVDR_SHEET_NAME = "NVDRTradingByStock"
@@ -51,8 +50,9 @@ NVDR_HEADERS = [
 LOG_SHEET_NAME = "Log"
 LOG_HEADERS = ["Date", "Time", "Workflow", "Trigger", "Status", "RowsSent", "Detail"]
 
-# หัวตารางแถวย่อยที่คาดไว้ (Volume 5 ช่อง ตามด้วย Value 5 ช่อง) ตามไฟล์ตัวอย่าง
-EXPECTED_SUBHEADERS = ["buy", "sell", "total", "net", "%"] * 2
+MIN_EXPECTED_ROWS = 30      # น้อยกว่านี้ถือว่าเก็บได้ไม่ครบ ไม่บันทึก
+MAX_SCROLL_STEPS = 600
+STAGNANT_LIMIT = 6          # เลื่อนต่อเนื่องแล้วจำนวนหุ้นไม่เพิ่มกี่รอบถึงหยุด
 
 ASOF_RE = re.compile(r"As of\s+(\d{1,2})\s+([A-Za-z]{3,9})\s+(\d{4})")
 EN_MONTHS = {
@@ -62,7 +62,66 @@ EN_MONTHS = {
 SYMBOL_RE = re.compile(r"^[A-Z0-9][A-Z0-9&.\-]{0,19}$")
 NOT_SYMBOLS = {"TOTAL", "SUM", "REMARK", "NOTE"}
 
+# ---------- JavaScript ที่ใช้บนหน้าเว็บ ----------
+_JS_FIND = """
+const findTable = () => {
+  const ts = Array.from(document.querySelectorAll('table')).filter(t => t.offsetParent !== null);
+  ts.sort((a, b) => b.querySelectorAll('tr').length - a.querySelectorAll('tr').length);
+  return ts[0] || null;
+};
+const findScroller = (t) => {
+  let el = t.parentElement;
+  while (el && el !== document.body && el !== document.documentElement) {
+    const cs = getComputedStyle(el);
+    if (/(auto|scroll)/.test(cs.overflowY) && el.scrollHeight > el.clientHeight + 5) return el;
+    el = el.parentElement;
+  }
+  return null;
+};
+"""
 
+JS_EXTRACT = "() => {" + _JS_FIND + """
+  const t = findTable();
+  if (!t) return null;
+  const rows = Array.from(t.querySelectorAll('tr')).map(tr =>
+    Array.from(tr.querySelectorAll('th,td')).map(c => (c.innerText || '').trim()));
+  const head = t.tHead ? (t.tHead.innerText || '')
+                       : rows.slice(0, 2).map(r => r.join(' ')).join(' ');
+  return {rows: rows, head: head};
+}"""
+
+JS_HEAD = "() => {" + _JS_FIND + """
+  const t = findTable();
+  if (!t) return '';
+  return t.tHead ? (t.tHead.innerText || '') : '';
+}"""
+
+JS_SCROLL_TOP = "() => {" + _JS_FIND + """
+  const t = findTable();
+  if (t) { const s = findScroller(t); if (s) s.scrollTop = 0; }
+  window.scrollTo(0, 0);
+}"""
+
+JS_SCROLL_STEP = "() => {" + _JS_FIND + """
+  const t = findTable();
+  if (!t) return {moved: false, inner: false};
+  const s = findScroller(t);
+  let moved = false;
+  if (s) {
+    const b = s.scrollTop;
+    s.scrollBy(0, Math.max(200, s.clientHeight * 0.8));
+    moved = s.scrollTop !== b;
+  }
+  if (!moved) {
+    const b = window.scrollY;
+    window.scrollBy(0, Math.max(300, window.innerHeight * 0.8));
+    moved = window.scrollY !== b;
+  }
+  return {moved: moved, inner: !!s};
+}"""
+
+
+# ---------- ฟังก์ชันประมวลผลข้อมูล (ไม่พึ่งเบราว์เซอร์ ทดสอบแยกได้) ----------
 def get_trigger_label() -> str:
     event_name = os.environ.get("GITHUB_EVENT_NAME", "")
     if event_name == "schedule":
@@ -79,12 +138,12 @@ def get_workflow_name() -> str:
 
 
 def _to_number(v):
-    """ช่องว่าง/NaN/'-' -> 0 ตัวเลขเต็ม -> int ที่เหลือคงทศนิยมเดิม"""
+    """ช่องว่าง/'-' -> 0 เลขเต็ม -> int ที่เหลือคงทศนิยมเดิม"""
     if v is None:
         return 0
     if isinstance(v, numbers.Real):
         f = float(v)
-        if f != f:  # NaN
+        if f != f:
             return 0
         return int(f) if f.is_integer() else f
     s = str(v).replace(",", "").strip()
@@ -97,86 +156,182 @@ def _to_number(v):
         return 0
 
 
-def parse_nvdr_excel(content: bytes):
-    """คืนค่า (date_str 'dd/mm/yyyy', rows) โดย rows = [[symbol, 10 ตัวเลข], ...]
-    ถ้าโครงสร้างไฟล์ไม่ตรงที่คาด จะ raise ValueError พร้อมบอกว่าเจออะไร"""
-    df = pd.read_excel(io.BytesIO(content), header=None, dtype=object)
+def parse_as_of(body_text: str):
+    m = ASOF_RE.search(body_text or "")
+    if not m:
+        return None
+    month = EN_MONTHS.get(m.group(2)[:3].lower())
+    if not month:
+        return None
+    return dt.date(int(m.group(3)), month, int(m.group(1)))
 
-    # 1) วันที่ของข้อมูล
-    as_of = None
-    for r in range(min(len(df), 12)):
-        for c in range(df.shape[1]):
-            v = df.iat[r, c]
-            if isinstance(v, str):
-                m = ASOF_RE.search(v)
-                if m:
-                    month = EN_MONTHS.get(m.group(2)[:3].lower())
-                    if month:
-                        as_of = dt.date(int(m.group(3)), month, int(m.group(1)))
-                        break
-        if as_of:
-            break
-    if as_of is None:
-        raise ValueError("หาข้อความ 'As of dd Mon yyyy' ในไฟล์ Excel ไม่เจอ")
 
-    # 2) แถวหัวตาราง
-    sym_idx = next((i for i in range(len(df))
-                    if isinstance(df.iat[i, 0], str) and df.iat[i, 0].strip() == "Symbol"), None)
-    if sym_idx is None:
-        raise ValueError("หาหัวคอลัมน์ 'Symbol' ในไฟล์ Excel ไม่เจอ")
-    if df.shape[1] < 11:
-        raise ValueError(f"ไฟล์มี {df.shape[1]} คอลัมน์ ต้องการอย่างน้อย 11")
+def unit_multiplier(head_text: str) -> int:
+    """อ่านหน่วยจากหัวตาราง เช่น ('000 บาท) -> 1000, (ล้านบาท) -> 1,000,000"""
+    h = head_text or ""
+    if re.search(r"million|ล้าน", h, re.I):
+        return 1_000_000
+    if re.search(r"['’`]000|thousand|พัน", h, re.I):
+        return 1000
+    return 1
 
-    sub_idx = None
-    for i in range(sym_idx, min(sym_idx + 4, len(df))):
-        cells = [str(df.iat[i, c]).replace("*", "").strip().lower() for c in range(1, 11)]
-        if cells == EXPECTED_SUBHEADERS:
-            sub_idx = i
-            break
-    if sub_idx is None:
-        seen = [[str(df.iat[i, c]).strip() for c in range(1, 11)]
-                for i in range(sym_idx, min(sym_idx + 3, len(df)))]
-        raise ValueError(f"หัวตารางย่อยไม่ตรงที่คาด (Buy,Sell,Total,Net,% x2) เจอ: {seen}")
 
-    # 3) แถวข้อมูล
+def check_head(head: str, view: str):
+    """หัวตารางต้องเป็นมุมมองที่ต้องการ และคอลัมน์เรียง Buy,Sell,Total,Net"""
+    if not re.search(rf"\b{view}\b", head or "", re.I):
+        raise ValueError(f"หัวตารางไม่ใช่มุมมอง {view}: {head[:80]!r}")
+    if not re.search(r"Buy.*Sell.*Total.*Net", head or "", re.S | re.I):
+        raise ValueError(f"ลำดับหัวคอลัมน์ไม่ใช่ Buy,Sell,Total,Net: {head[:120]!r}")
+
+
+def parse_view_rows(raw_rows) -> dict:
+    """แปลงแถวดิบของตาราง -> {symbol: [Buy, Sell, Total, Net, %]} (ตัวเลขดิบ ยังไม่คูณหน่วย)"""
+    out = {}
+    for cells in raw_rows:
+        cells = list(cells)
+        if cells and not (cells[0] or "").strip() and len(cells) >= 7:
+            cells = cells[1:]          # มีคอลัมน์นำหน้าที่ว่าง (เช่น ไอคอนดาว)
+        if len(cells) < 6:
+            continue
+        first = (cells[0] or "").strip()
+        if not first:
+            continue
+        # ข้ามไอคอน/สัญลักษณ์นำหน้า (เช่น ดาว) แล้วใช้คำแรกที่หน้าตาเป็นชื่อหุ้น
+        sym = next((tok for tok in first.split() if SYMBOL_RE.match(tok)), None)
+        if sym is None or sym in NOT_SYMBOLS:
+            continue
+        out[sym] = [_to_number(c) for c in cells[1:6]]
+    return out
+
+
+def _scale(vals, mult):
+    out = []
+    for i, v in enumerate(vals):
+        if i < 4 and mult != 1:
+            v = v * mult
+        if isinstance(v, float) and v.is_integer():
+            v = int(v)
+        out.append(v)
+    return out
+
+
+def merge_views(vol: dict, vol_mult: int, val: dict, val_mult: int):
     rows = []
-    for i in range(sub_idx + 1, len(df)):
-        sym = df.iat[i, 0]
-        if not isinstance(sym, str):
+    for sym in sorted(set(vol) | set(val)):
+        rows.append([sym] + _scale(vol.get(sym, [0] * 5), vol_mult)
+                    + _scale(val.get(sym, [0] * 5), val_mult))
+    return rows
+
+
+def sanity_check(vol: dict, val: dict):
+    n = max(len(vol), len(val))
+    if n < MIN_EXPECTED_ROWS:
+        raise ValueError(f"เก็บได้เพียง Volume {len(vol)} หุ้น / Value {len(val)} หุ้น "
+                         f"น้อยผิดปกติ (ขั้นต่ำ {MIN_EXPECTED_ROWS}) ไม่บันทึก")
+    if min(len(vol), len(val)) < 0.9 * n:
+        raise ValueError(f"จำนวนหุ้นของ Volume ({len(vol)}) กับ Value ({len(val)}) "
+                         "ต่างกันมาก อาจโหลดไม่ครบ ไม่บันทึก")
+
+
+# ---------- ส่วนที่ทำงานกับเบราว์เซอร์ ----------
+def _head_text(page) -> str:
+    return page.evaluate(JS_HEAD) or ""
+
+
+def click_toggle(page, name: str) -> bool:
+    candidates = [
+        page.locator("xpath=//*[contains(normalize-space(text()),'Categorized by')]/..")
+            .get_by_text(name, exact=True),
+        page.get_by_role("button", name=name, exact=True),
+        page.get_by_role("tab", name=name, exact=True),
+        page.get_by_text(name, exact=True),
+    ]
+    for loc in candidates:
+        try:
+            if loc.count() > 0:
+                loc.first.click(timeout=5000)
+                return True
+        except Exception:
             continue
-        s = sym.strip()
-        if s in NOT_SYMBOLS or not SYMBOL_RE.match(s):
-            continue
-        rows.append([s] + [_to_number(df.iat[i, c]) for c in range(1, 11)])
-
-    return as_of.strftime("%d/%m/%Y"), rows
+    return False
 
 
-def download_excel_bytes():
-    """เปิดหน้า NVDR Trading by Stock แล้วกด Export Excel คืนค่าเนื้อไฟล์"""
+def ensure_view(page, view: str):
+    """ให้ตารางอยู่ในมุมมอง Volume หรือ Value (กดปุ่มสลับถ้ายังไม่ใช่)"""
+    pat = rf"\b{view}\b"
+    if re.search(pat, _head_text(page), re.I):
+        return
+    if not click_toggle(page, view):
+        raise RuntimeError(f"หาปุ่มสลับมุมมอง '{view}' ไม่เจอ")
+    for _ in range(40):
+        page.wait_for_timeout(500)
+        if re.search(pat, _head_text(page), re.I):
+            page.wait_for_timeout(1500)
+            return
+    raise RuntimeError(f"กดสลับเป็น '{view}' แล้วแต่หัวตารางไม่เปลี่ยน")
+
+
+def collect_view(page):
+    """เลื่อนตารางไปเรื่อย ๆ เก็บแถวสะสมตาม Symbol จนจำนวนหุ้นไม่เพิ่ม
+    คืนค่า (dict ของหุ้น, ข้อความหัวตาราง, จำนวนรอบที่เลื่อน)"""
+    page.evaluate(JS_SCROLL_TOP)
+    page.wait_for_timeout(800)
+    seen, head, stagnant, steps = {}, "", 0, 0
+    for steps in range(1, MAX_SCROLL_STEPS + 1):
+        data = page.evaluate(JS_EXTRACT)
+        if not data:
+            raise RuntimeError("ไม่พบตารางบนหน้าเว็บ")
+        head = data.get("head") or head
+        before = len(seen)
+        seen.update(parse_view_rows(data["rows"]))
+        page.evaluate(JS_SCROLL_STEP)
+        page.wait_for_timeout(450)
+        stagnant = 0 if len(seen) > before else stagnant + 1
+        if stagnant >= STAGNANT_LIMIT:
+            break
+    return seen, head, steps
+
+
+def fetch_nvdr_data():
+    """คืนค่า (date_str 'dd/mm/yyyy', rows, info)"""
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
-        page = browser.new_page(viewport={"width": 1600, "height": 2400})
+        page = browser.new_page(viewport={"width": 1600, "height": 1400})
         try:
             page.goto(NVDR_URL, wait_until="domcontentloaded", timeout=60000)
             try:
                 page.wait_for_selector("table", timeout=30000)
             except PlaywrightTimeoutError:
-                print("  คำเตือน: รอตาราง (<table>) ไม่เจอภายในเวลาที่กำหนด")
+                raise RuntimeError("รอตาราง (<table>) บนหน้า NVDR ไม่เจอ (URL อาจไม่ถูกต้อง)")
             page.wait_for_timeout(3000)
+            as_of = parse_as_of(page.evaluate("() => document.body.innerText || ''"))
 
-            with page.expect_download(timeout=60000) as dl_info:
-                try:
-                    page.get_by_role("button", name=re.compile("Export Excel", re.I)).first.click(timeout=10000)
-                except Exception:
-                    page.get_by_text("Export Excel").first.click(timeout=10000)
-            download = dl_info.value
-            with open(download.path(), "rb") as f:
-                return f.read()
+            ensure_view(page, "Volume")
+            vol, vol_head, vol_steps = collect_view(page)
+            check_head(vol_head, "Volume")
+
+            ensure_view(page, "Value")
+            val, val_head, val_steps = collect_view(page)
+            check_head(val_head, "Value")
+
+            if as_of is None:
+                as_of = parse_as_of(page.evaluate("() => document.body.innerText || ''"))
         finally:
             browser.close()
 
+    if as_of is None:
+        raise ValueError("หาข้อความ 'As of dd Mon yyyy' บนหน้าเว็บไม่เจอ")
+    sanity_check(vol, val)
 
+    vm, am = unit_multiplier(vol_head), unit_multiplier(val_head)
+    rows = merge_views(vol, vm, val, am)
+    info = (f"{len(rows)} หุ้น (Volume {len(vol)}/Value {len(val)}) "
+            f"แรก={rows[0][0]} ท้าย={rows[-1][0]} หน่วย x{vm}/x{am} "
+            f"เลื่อน {vol_steps}+{val_steps} รอบ")
+    return as_of.strftime("%d/%m/%Y"), rows, info
+
+
+# ---------- Google Sheets ----------
 def get_open_spreadsheet():
     sheet_id = os.environ.get("GSHEET_ID")
     creds_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
@@ -188,7 +343,6 @@ def get_open_spreadsheet():
 
 
 def get_or_create_worksheet(sh, title: str, rows: int, cols: int):
-    """หาแท็บแบบ normalize ชื่อ (กันบั๊กชื่อแท็บที่เคยเจอ) ไม่เจอค่อยสร้างใหม่"""
     def norm(s):
         return re.sub(r"[^a-zA-Z0-9]", "", s).lower()
 
@@ -242,19 +396,13 @@ def capture_once():
     sh = get_open_spreadsheet()
 
     try:
-        content = download_excel_bytes()
-        data_date, rows = parse_nvdr_excel(content)
+        data_date, rows, info = fetch_nvdr_data()
     except Exception as e:
         detail = f"{type(e).__name__}: {str(e)[:300]}"
         push_to_log(sh, date_str, time_str, workflow_name, trigger_label, "Failed", 0, detail)
         raise
 
-    print(f"  ไฟล์ Excel เป็นข้อมูลวันที่ {data_date} จำนวน {len(rows)} หุ้น")
-
-    if not rows:
-        push_to_log(sh, date_str, time_str, workflow_name, trigger_label, "NoData", 0,
-                    f"ไฟล์ข้อมูลวันที่ {data_date} ไม่มีแถวหุ้น")
-        return
+    print(f"  ข้อมูลวันที่ {data_date}: {info}")
 
     ws = get_or_create_worksheet(sh, NVDR_SHEET_NAME, rows=len(rows) + 1000, cols=15)
     if len(ws.get_all_values()) == 0:
@@ -277,7 +425,7 @@ def capture_once():
 
     print(f"  ส่ง {len(out)} แถว เข้า worksheet '{NVDR_SHEET_NAME}'")
     push_to_log(sh, date_str, time_str, workflow_name, trigger_label, "Success", len(out),
-                f"ข้อมูลวันที่ {data_date}")
+                f"วันที่ {data_date} | {info}")
 
 
 if __name__ == "__main__":
