@@ -238,37 +238,93 @@ def _head_text(page) -> str:
     return page.evaluate(JS_HEAD) or ""
 
 
-def click_toggle(page, name: str) -> bool:
-    candidates = [
-        page.locator("xpath=//*[contains(normalize-space(text()),'Categorized by')]/..")
-            .get_by_text(name, exact=True),
-        page.get_by_role("button", name=name, exact=True),
-        page.get_by_role("tab", name=name, exact=True),
-        page.get_by_text(name, exact=True),
-    ]
-    for loc in candidates:
-        try:
-            if loc.count() > 0:
-                loc.first.click(timeout=5000)
-                return True
-        except Exception:
-            continue
-    return False
+TOGGLE_ALIASES = {"Volume": ["volume", "ปริมาณ"], "Value": ["value", "มูลค่า"]}
+
+# คลิกด้วย DOM event โดยตรง (ใช้เป็นทางสุดท้าย เผื่อปุ่มถูกบัง/ไม่ใช่ <button> ปกติ)
+# เลือกองค์ประกอบ "ใบ" ที่ข้อความตรงชื่อมุมมอง ใกล้ข้อความ 'Categorized by' ก่อน
+JS_CLICK_TOGGLE = r"""(names) => {
+  const norm = s => (s || '').replace(/\s+/g, ' ').trim().toLowerCase();
+  const wanted = names.map(norm);
+  const isTarget = e => wanted.includes(norm(e.textContent)) && e.children.length <= 2;
+  const all = Array.from(document.querySelectorAll('body *'));
+  const fire = el => {
+    for (const t of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
+      el.dispatchEvent(new MouseEvent(t, {bubbles: true, cancelable: true, view: window}));
+    }
+  };
+  const leaves = list => list.filter(e => !Array.from(e.querySelectorAll('*')).some(isTarget));
+  const labels = all.filter(e => norm(e.textContent).includes('categorized by') && norm(e.textContent).length < 160)
+                    .sort((a, b) => norm(a.textContent).length - norm(b.textContent).length);
+  for (const l of labels) {
+    const scope = l.parentElement || l;
+    const hits = leaves(Array.from(scope.querySelectorAll('*')).filter(isTarget));
+    if (hits.length) { fire(hits[0]); return {clicked: true, where: 'near-label', tag: hits[0].tagName}; }
+  }
+  const hits = leaves(all.filter(isTarget));
+  if (hits.length) { fire(hits[0]); return {clicked: true, where: 'page', tag: hits[0].tagName}; }
+  const sc = labels.length ? (labels[0].parentElement || labels[0]) : null;
+  let html = null;
+  if (sc) {
+    const h = sc.outerHTML.replace(/\s+/g, ' ');
+    const i = Math.max(0, h.toLowerCase().indexOf('categorized by'));
+    html = h.slice(Math.max(0, i - 120), i + 600);
+  }
+  return {clicked: false, html: html};
+}"""
+
+
+def _view_active(page, view: str) -> bool:
+    return bool(re.search(rf"\b{view}\b", _head_text(page), re.I))
+
+
+def _wait_view(page, view: str, timeout_s: float) -> bool:
+    for _ in range(int(timeout_s / 0.5)):
+        if _view_active(page, view):
+            return True
+        page.wait_for_timeout(500)
+    return _view_active(page, view)
 
 
 def ensure_view(page, view: str):
-    """ให้ตารางอยู่ในมุมมอง Volume หรือ Value (กดปุ่มสลับถ้ายังไม่ใช่)"""
-    pat = rf"\b{view}\b"
-    if re.search(pat, _head_text(page), re.I):
+    """ให้ตารางอยู่ในมุมมอง Volume หรือ Value ถ้ายังไม่ใช่จะลองกดปุ่มสลับหลายวิธี
+    ตามลำดับ (คลิกจริง -> คลิกแบบบังคับ -> ส่ง DOM event) และตรวจทุกครั้งว่าหัวตาราง
+    เปลี่ยนจริงหรือไม่ ถ้าไม่สำเร็จจะแสดงโครงสร้าง HTML รอบปุ่มไว้ใน error"""
+    if _view_active(page, view):
         return
-    if not click_toggle(page, view):
-        raise RuntimeError(f"หาปุ่มสลับมุมมอง '{view}' ไม่เจอ")
-    for _ in range(40):
-        page.wait_for_timeout(500)
-        if re.search(pat, _head_text(page), re.I):
-            page.wait_for_timeout(1500)
-            return
-    raise RuntimeError(f"กดสลับเป็น '{view}' แล้วแต่หัวตารางไม่เปลี่ยน")
+    page.evaluate(JS_SCROLL_TOP)
+    page.wait_for_timeout(600)
+
+    rx = re.compile(r"^\s*(?:" + "|".join(re.escape(a) for a in TOGGLE_ALIASES[view]) + r")\s*$", re.I)
+    locators = [
+        page.locator("xpath=//*[contains(normalize-space(text()),'Categorized by')]/..").get_by_text(rx),
+        page.get_by_role("button", name=rx),
+        page.get_by_role("tab", name=rx),
+        page.get_by_role("radio", name=rx),
+        page.get_by_role("link", name=rx),
+        page.get_by_text(rx),
+    ]
+    for loc in locators:
+        try:
+            if loc.count() == 0:
+                continue
+        except Exception:
+            continue
+        for force in (False, True):
+            try:
+                loc.first.click(timeout=3000, force=force)
+            except Exception:
+                continue
+            if _wait_view(page, view, 6):
+                page.wait_for_timeout(1500)
+                return
+
+    info = page.evaluate(JS_CLICK_TOGGLE, TOGGLE_ALIASES[view]) or {}
+    if info.get("clicked") and _wait_view(page, view, 8):
+        page.wait_for_timeout(1500)
+        return
+
+    snippet = info.get("html") or "ไม่พบข้อความ 'Categorized by' บนหน้า"
+    raise RuntimeError(f"สลับเป็นมุมมอง '{view}' ไม่สำเร็จ | HTML ใกล้ปุ่ม: {snippet}")
 
 
 def collect_view(page):
@@ -398,7 +454,7 @@ def capture_once():
     try:
         data_date, rows, info = fetch_nvdr_data()
     except Exception as e:
-        detail = f"{type(e).__name__}: {str(e)[:300]}"
+        detail = f"{type(e).__name__}: {str(e)[:900]}"
         push_to_log(sh, date_str, time_str, workflow_name, trigger_label, "Failed", 0, detail)
         raise
 
@@ -419,7 +475,7 @@ def capture_once():
     try:
         ws.append_rows(out, value_input_option="USER_ENTERED", table_range="A1")
     except Exception as e:
-        detail = f"{type(e).__name__}: {str(e)[:300]}"
+        detail = f"{type(e).__name__}: {str(e)[:900]}"
         push_to_log(sh, date_str, time_str, workflow_name, trigger_label, "Failed", 0, detail)
         raise
 
