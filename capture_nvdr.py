@@ -40,12 +40,13 @@ BANGKOK_TZ = ZoneInfo("Asia/Bangkok")
 NVDR_URL = "https://www.set.or.th/th/market/statistics/nvdr/trading-by-stock"
 
 NVDR_SHEET_NAME = "NVDRTradingByStock"
-NVDR_HEADERS = [
-    "Date", "Symbol",
-    "Vol.Buy", "Vol.Sell", "Vol.Total", "Vol.Net", "Vol%",
-    "Val.Buy", "Val.Sell", "Val.Total", "Val.Net", "Val%",
-    "Trigger",
-]
+# รูปแบบแท็บให้เหมือนไฟล์ Export จากเว็บ SET (หัว 2 แถว) แต่มี Date และ Symbol นำหน้า
+NVDR_GROUP_ROW = ["", "", "Volume (Share)", "", "", "", "", "Value (Baht)", "", "", "", ""]
+NVDR_COL_ROW = ["Date", "Symbol", "Buy", "Sell", "Total", "Net", "%*",
+                "Buy", "Sell", "Total", "Net", "%*"]
+
+# ช่องที่เว็บแสดง "-" (ไม่มีรายการ): False = เว้นว่างเหมือนไฟล์ Export, True = ใส่ 0
+FILL_ZERO_FOR_BLANK = False
 
 LOG_SHEET_NAME = "Log"
 LOG_HEADERS = ["Date", "Time", "Workflow", "Trigger", "Status", "RowsSent", "Detail"]
@@ -137,23 +138,31 @@ def get_workflow_name() -> str:
     return os.environ.get("GITHUB_WORKFLOW", "local")
 
 
-def _to_number(v):
-    """ช่องว่าง/'-' -> 0 เลขเต็ม -> int ที่เหลือคงทศนิยมเดิม"""
-    if v is None:
-        return 0
-    if isinstance(v, numbers.Real):
-        f = float(v)
-        if f != f:
-            return 0
-        return int(f) if f.is_integer() else f
-    s = str(v).replace(",", "").strip()
+_NUMERIC_CELL_RE = re.compile(r"^-?[\d,]*\.?\d+$")
+
+
+def _is_numeric_cell(c) -> bool:
+    s = (c or "").strip()
+    return s in ("", "-") or bool(_NUMERIC_CELL_RE.match(s))
+
+
+def _num_or_none(c):
+    """'-' หรือช่องว่าง -> None, ตัวเลข -> int/float"""
+    s = str(c if c is not None else "").replace(",", "").strip()
     if s in ("", "-"):
-        return 0
+        return None
     try:
         f = float(s)
-        return int(f) if f.is_integer() else f
     except ValueError:
-        return 0
+        return None
+    return int(f) if f.is_integer() else f
+
+
+def _identity_ok(w) -> bool:
+    """ข้อมูลจริงต้องเป็น Total = Buy + Sell และ Net = Buy - Sell (None นับเป็น 0)"""
+    buy, sell, total, net = [(x or 0) for x in w[:4]]
+    tol = max(1, 0.001 * abs(total))
+    return abs(total - (buy + sell)) <= tol and abs(net - (buy - sell)) <= tol
 
 
 def parse_as_of(body_text: str):
@@ -185,29 +194,41 @@ def check_head(head: str, view: str):
 
 
 def parse_view_rows(raw_rows) -> dict:
-    """แปลงแถวดิบของตาราง -> {symbol: [Buy, Sell, Total, Net, %]} (ตัวเลขดิบ ยังไม่คูณหน่วย)"""
+    """แปลงแถวดิบของตาราง -> {symbol: ([Buy, Sell, Total, Net, %], ผ่านสูตรตรวจ?)}
+    ไม่ฟิกตำแหน่งคอลัมน์ เพราะเว็บมีช่องแทรกหลัง Symbol: ลองช่วง 5 ช่องตัวเลข
+    จากขวาไปซ้าย แล้วเลือกช่วงแรกที่ Total=Buy+Sell และ Net=Buy-Sell"""
     out = {}
     for cells in raw_rows:
-        cells = list(cells)
-        if cells and not (cells[0] or "").strip() and len(cells) >= 7:
-            cells = cells[1:]          # มีคอลัมน์นำหน้าที่ว่าง (เช่น ไอคอนดาว)
+        cells = [(c or "").strip() for c in cells]
         if len(cells) < 6:
             continue
-        first = (cells[0] or "").strip()
-        if not first:
-            continue
-        # ข้ามไอคอน/สัญลักษณ์นำหน้า (เช่น ดาว) แล้วใช้คำแรกที่หน้าตาเป็นชื่อหุ้น
-        sym = next((tok for tok in first.split() if SYMBOL_RE.match(tok)), None)
+        sym = None
+        for c in cells[:-5]:
+            sym = next((tok for tok in c.split() if SYMBOL_RE.match(tok)), None)
+            if sym:
+                break
         if sym is None or sym in NOT_SYMBOLS:
             continue
-        out[sym] = [_to_number(c) for c in cells[1:6]]
+        chosen = None
+        for start in range(len(cells) - 5, 0, -1):
+            window = cells[start:start + 5]
+            if not all(_is_numeric_cell(c) for c in window):
+                continue
+            nums = [_num_or_none(c) for c in window]
+            if _identity_ok(nums):
+                chosen = nums
+                break
+        if chosen is not None:
+            out[sym] = (chosen, True)
+        else:
+            out[sym] = ([_num_or_none(c) for c in cells[-5:]], False)
     return out
 
 
 def _scale(vals, mult):
     out = []
     for i, v in enumerate(vals):
-        if i < 4 and mult != 1:
+        if v is not None and i < 4 and mult != 1:
             v = v * mult
         if isinstance(v, float) and v.is_integer():
             v = int(v)
@@ -216,11 +237,20 @@ def _scale(vals, mult):
 
 
 def merge_views(vol: dict, vol_mult: int, val: dict, val_mult: int):
-    rows = []
-    for sym in sorted(set(vol) | set(val)):
-        rows.append([sym] + _scale(vol.get(sym, [0] * 5), vol_mult)
-                    + _scale(val.get(sym, [0] * 5), val_mult))
-    return rows
+    blank = [None] * 5
+    return [[s] + _scale(vol.get(s, blank), vol_mult) + _scale(val.get(s, blank), val_mult)
+            for s in sorted(set(vol) | set(val))]
+
+
+def check_alignment(vol: dict, val: dict) -> int:
+    """ถ้าหลายแถวไม่เข้าสูตร Total=Buy+Sell, Net=Buy-Sell แปลว่าคอลัมน์อาจเลื่อน -> ไม่บันทึก"""
+    bad = [("Volume", s) for s, (_, ok) in vol.items() if not ok]
+    bad += [("Value", s) for s, (_, ok) in val.items() if not ok]
+    total = len(vol) + len(val)
+    if len(bad) > max(2, 0.01 * total):
+        raise ValueError(f"ตรวจ Total=Buy+Sell และ Net=Buy-Sell ไม่ผ่าน {len(bad)} จาก {total} แถว "
+                         f"(คอลัมน์อาจเลื่อน) ตัวอย่าง: {bad[:5]}")
+    return len(bad)
 
 
 def sanity_check(vol: dict, val: dict):
@@ -378,12 +408,15 @@ def fetch_nvdr_data():
     if as_of is None:
         raise ValueError("หาข้อความ 'As of dd Mon yyyy' บนหน้าเว็บไม่เจอ")
     sanity_check(vol, val)
+    bad = check_alignment(vol, val)
+    vol_n = {s: v[0] for s, v in vol.items()}
+    val_n = {s: v[0] for s, v in val.items()}
 
     vm, am = unit_multiplier(vol_head), unit_multiplier(val_head)
-    rows = merge_views(vol, vm, val, am)
-    info = (f"{len(rows)} หุ้น (Volume {len(vol)}/Value {len(val)}) "
+    rows = merge_views(vol_n, vm, val_n, am)
+    info = (f"{len(rows)} หุ้น (Volume {len(vol_n)}/Value {len(val_n)}) "
             f"แรก={rows[0][0]} ท้าย={rows[-1][0]} หน่วย x{vm}/x{am} "
-            f"เลื่อน {vol_steps}+{val_steps} รอบ")
+            f"ไม่เข้าสูตร {bad} แถว เลื่อน {vol_steps}+{val_steps} รอบ")
     return as_of.strftime("%d/%m/%Y"), rows, info
 
 
@@ -422,11 +455,24 @@ def get_or_create_worksheet(sh, title: str, rows: int, cols: int):
         raise
 
 
-def date_already_captured(ws, date_str: str) -> bool:
+def date_already_captured(values, date_str: str) -> bool:
+    return date_str in {(r[0] if r else "").lstrip("'").strip() for r in values}
+
+
+def style_headers(ws):
+    """จัดหัวตาราง 2 แถวให้หน้าตาใกล้ไฟล์ Export (ผสานเซลล์ ตัวหนา สีส้ม ตรึง 2 แถว)
+    ถ้าตกแต่งไม่สำเร็จไม่กระทบการบันทึกข้อมูล"""
     try:
-        return date_str in {c.lstrip("'").strip() for c in ws.col_values(1)}
-    except Exception:
-        return False
+        ws.merge_cells("C1:G1")
+        ws.merge_cells("H1:L1")
+        ws.format("A1:L2", {
+            "textFormat": {"bold": True},
+            "horizontalAlignment": "CENTER",
+            "backgroundColor": {"red": 0.98, "green": 0.69, "blue": 0.23},
+        })
+        ws.freeze(rows=2)
+    except Exception as e:
+        print(f"  คำเตือน: ตกแต่งหัวตารางไม่สำเร็จ ({type(e).__name__}) ข้ามไป")
 
 
 def push_to_log(sh, date_str, time_str, workflow_name, trigger_label, status, rows_sent, detail=""):
@@ -461,17 +507,30 @@ def capture_once():
     print(f"  ข้อมูลวันที่ {data_date}: {info}")
 
     ws = get_or_create_worksheet(sh, NVDR_SHEET_NAME, rows=len(rows) + 1000, cols=15)
-    if len(ws.get_all_values()) == 0:
-        ws.append_row(NVDR_HEADERS, value_input_option="USER_ENTERED", table_range="A1")
+    existing = ws.get_all_values()
+    try:
+        if not existing:
+            ws.append_rows([NVDR_GROUP_ROW, NVDR_COL_ROW], value_input_option="USER_ENTERED",
+                           table_range="A1")
+            style_headers(ws)
+        elif [c.strip() for c in (existing[1] if len(existing) > 1 else [])][:12] != NVDR_COL_ROW:
+            raise ValueError(f"แท็บ {NVDR_SHEET_NAME} มีข้อมูลรูปแบบเก่า (ไม่มีหัวตาราง 2 แถวตามรูปแบบใหม่) "
+                             "กรุณาลบข้อมูลทั้งหมดในแท็บนี้ก่อน แล้วรันใหม่")
+    except Exception as e:
+        detail = f"{type(e).__name__}: {str(e)[:900]}"
+        push_to_log(sh, date_str, time_str, workflow_name, trigger_label, "Failed", 0, detail)
+        raise
 
-    if date_already_captured(ws, data_date):
+    if date_already_captured(existing, data_date):
         print(f"  มีข้อมูลวันที่ {data_date} อยู่แล้ว -> ไม่บันทึกซ้ำ")
         push_to_log(sh, date_str, time_str, workflow_name, trigger_label, "AlreadyCaptured", 0,
                     f"มีข้อมูล NVDR ของวันที่ {data_date} อยู่แล้ว")
         return
 
     # ขึ้นต้นด้วย ' ให้ Sheets เก็บวันที่เป็นข้อความล้วน (เหมือน SectorIndex)
-    out = [[f"'{data_date}"] + r + [trigger_label] for r in rows]
+    def _cell(v):
+        return (0 if FILL_ZERO_FOR_BLANK else "") if v is None else v
+    out = [[f"'{data_date}", r[0]] + [_cell(v) for v in r[1:]] for r in rows]
     try:
         ws.append_rows(out, value_input_option="USER_ENTERED", table_range="A1")
     except Exception as e:
