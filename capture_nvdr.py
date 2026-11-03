@@ -1,5 +1,5 @@
 """
-capture_nvdr.py  (เวอร์ชันอ่านตารางจากหน้าเว็บ ไม่ใช้ Export Excel)
+Capture NVDR  v1.1.0  (capture_nvdr.py)
 ------------------------------------------------------------------
 Capture NVDR Trading by Stock (รายหุ้น) จาก set.or.th แล้ว append เข้าแท็บ
 NVDRTradingByStock ใน Google Sheet "Settrade Capture Log"
@@ -21,6 +21,13 @@ NVDRTradingByStock ใน Google Sheet "Settrade Capture Log"
 Environment variables:
     GSHEET_ID
     GOOGLE_APPLICATION_CREDENTIALS
+    NVDR_RESET_TAB   (ไม่บังคับ) = true ล้างข้อมูลเดิมในแท็บก่อนบันทึก
+
+Changelog (เพิ่มเวอร์ชันทุกครั้งที่แก้ไฟล์นี้ และเวอร์ชันจะแสดงใน Log คอลัมน์ Detail):
+  1.1.0  อ่านตารางจากหน้าเว็บ (เลิกใช้ Export Excel), จัดช่องตามสูตร Total=Buy+Sell /
+         Net=Buy-Sell, หัวตาราง 2 แถว ไม่มีคอลัมน์ Trigger, รองรับตารางที่แบ่งหน้า
+         (ปุ่ม Next / เลขหน้า / Load more), ตัวเลือก reset_tab, แสดงเวอร์ชันใน Log
+  1.0.0  เวอร์ชันแรก ดาวน์โหลด Export Excel (อ่านไฟล์ไม่ได้ เลิกใช้แล้ว)
 """
 
 import os
@@ -34,6 +41,9 @@ from zoneinfo import ZoneInfo
 import gspread
 from google.oauth2.service_account import Credentials
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+
+SCRIPT_NAME = "Capture NVDR"
+__version__ = "1.1.0"
 
 BANGKOK_TZ = ZoneInfo("Asia/Bangkok")
 
@@ -53,6 +63,8 @@ LOG_HEADERS = ["Date", "Time", "Workflow", "Trigger", "Status", "RowsSent", "Det
 
 MIN_EXPECTED_ROWS = 30      # น้อยกว่านี้ถือว่าเก็บได้ไม่ครบ ไม่บันทึก
 MAX_SCROLL_STEPS = 600
+MAX_PAGES = 60              # จำนวนหน้า/การกดโหลดเพิ่มสูงสุดต่อมุมมอง
+SUSPICIOUS_ROUND_COUNTS = {50, 100, 200, 500}   # ได้จำนวนกลมแบบนี้แต่ไม่เจอปุ่มหน้าถัดไป = น่าจะไม่ครบ
 STAGNANT_LIMIT = 6          # เลื่อนต่อเนื่องแล้วจำนวนหุ้นไม่เพิ่มกี่รอบถึงหยุด
 
 ASOF_RE = re.compile(r"As of\s+(\d{1,2})\s+([A-Za-z]{3,9})\s+(\d{4})")
@@ -119,6 +131,54 @@ JS_SCROLL_STEP = "() => {" + _JS_FIND + """
     moved = window.scrollY !== b;
   }
   return {moved: moved, inner: !!s};
+}"""
+
+
+JS_FIND_CONTROL = "(arg) => {" + _JS_FIND + r"""
+  document.querySelectorAll('[data-nvdr-ctl]').forEach(e => e.removeAttribute('data-nvdr-ctl'));
+  const t = findTable();
+  if (!t) return {found: false};
+  const cont = findScroller(t) || t;
+  const bottom = cont.getBoundingClientRect().bottom;
+  const norm = s => (s || '').replace(/\s+/g, ' ').trim();
+  const vis = e => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+  const isDisabled = e => {
+    const li = e.closest('li');
+    return !!(e.disabled || e.getAttribute('aria-disabled') === 'true' ||
+              /disabled/i.test((e.className || '').toString()) ||
+              (li && /disabled/i.test((li.className || '').toString())));
+  };
+  const samePage = e => {
+    if (e.tagName !== 'A' || !e.getAttribute('href')) return true;
+    try { return new URL(e.href, location.href).pathname === location.pathname; } catch (x) { return false; }
+  };
+  const cands = Array.from(document.querySelectorAll('button, a, [role="button"], li'))
+    .filter(e => vis(e) && !t.contains(e) && samePage(e) && e.getBoundingClientRect().top >= bottom - 8);
+  const NEXT = /^(next|next page|ถัดไป|หน้าถัดไป|load more|show more|more|ดูเพิ่มเติม|แสดงเพิ่มเติม|เพิ่มเติม|[>›»→])$/i;
+  const PREV = /^(prev|previous|previous page|ก่อนหน้า|หน้าก่อนหน้า|[<‹«←])$/i;
+  const clsRe = arg.mode === 'next' ? /(^|[-_\s])next($|[-_\s])/i : /(^|[-_\s])prev(ious)?($|[-_\s])/i;
+  const matches = e => {
+    if (arg.mode === 'page') return norm(e.innerText) === String(arg.num);
+    const re = arg.mode === 'next' ? NEXT : PREV;
+    const pieces = [norm(e.innerText), e.getAttribute('aria-label') || '', e.getAttribute('title') || ''];
+    return pieces.some(x => re.test(x.trim())) || clsRe.test((e.className || '').toString());
+  };
+  let hits = cands.filter(matches);
+  hits = hits.filter(e => !hits.some(o => o !== e && e.contains(o)));
+  if (!hits.length) return {found: false};
+  const el = hits[0];
+  el.setAttribute('data-nvdr-ctl', '1');
+  return {found: true, enabled: !isDisabled(el), text: norm(el.innerText).slice(0, 30)};
+}"""
+
+JS_DIAG_BELOW = "() => {" + _JS_FIND + r"""
+  const t = findTable();
+  if (!t) return '';
+  let p = (findScroller(t) || t).parentElement;
+  for (let i = 0; i < 2 && p && p.parentElement; i++) p = p.parentElement;
+  const h = (p ? p.outerHTML : '').replace(/\s+/g, ' ');
+  const i = h.lastIndexOf('</table>');
+  return h.slice(Math.max(0, i), Math.max(0, i) + 900);
 }"""
 
 
@@ -357,12 +417,9 @@ def ensure_view(page, view: str):
     raise RuntimeError(f"สลับเป็นมุมมอง '{view}' ไม่สำเร็จ | HTML ใกล้ปุ่ม: {snippet}")
 
 
-def collect_view(page):
-    """เลื่อนตารางไปเรื่อย ๆ เก็บแถวสะสมตาม Symbol จนจำนวนหุ้นไม่เพิ่ม
-    คืนค่า (dict ของหุ้น, ข้อความหัวตาราง, จำนวนรอบที่เลื่อน)"""
-    page.evaluate(JS_SCROLL_TOP)
-    page.wait_for_timeout(800)
-    seen, head, stagnant, steps = {}, "", 0, 0
+def _scroll_collect(page, seen):
+    """เลื่อนหน้า/ตารางไปเรื่อย ๆ เก็บแถวสะสมลง seen จนจำนวนหุ้นไม่เพิ่ม"""
+    stagnant, steps, head = 0, 0, ""
     for steps in range(1, MAX_SCROLL_STEPS + 1):
         data = page.evaluate(JS_EXTRACT)
         if not data:
@@ -375,11 +432,88 @@ def collect_view(page):
         stagnant = 0 if len(seen) > before else stagnant + 1
         if stagnant >= STAGNANT_LIMIT:
             break
-    return seen, head, steps
+    return head, steps
+
+
+def _find_control(page, mode, num=None):
+    return page.evaluate(JS_FIND_CONTROL, {"mode": mode, "num": num}) or {"found": False}
+
+
+def _signature(page):
+    data = page.evaluate(JS_EXTRACT)
+    if not data:
+        return None
+    syms = sorted(parse_view_rows(data["rows"]))
+    return (len(syms), syms[0] if syms else "", syms[-1] if syms else "")
+
+
+def _click_marked(page) -> bool:
+    try:
+        page.locator('[data-nvdr-ctl="1"]').first.click(timeout=4000)
+        return True
+    except Exception:
+        try:
+            page.evaluate("() => { const e = document.querySelector('[data-nvdr-ctl=\"1\"]'); if (e) e.click(); }")
+            return True
+        except Exception:
+            return False
+
+
+def _click_and_wait_change(page, mode, num=None) -> bool:
+    """กดปุ่ม (next/prev/เลขหน้า) แล้วรอจนข้อมูลในตารางเปลี่ยน คืน True ถ้าเปลี่ยนจริง"""
+    info = _find_control(page, mode, num)
+    if not info.get("found") or not info.get("enabled", True):
+        return False
+    before = _signature(page)
+    if not _click_marked(page):
+        return False
+    for _ in range(24):
+        page.wait_for_timeout(400)
+        if _signature(page) != before:
+            page.wait_for_timeout(500)
+            return True
+    return False
+
+
+def advance_page(page, state) -> bool:
+    """ไปหน้าถัดไป/โหลดเพิ่ม: ลองปุ่ม Next ก่อน ไม่มีค่อยลองกดเลขหน้าถัดไป"""
+    if _click_and_wait_change(page, "next"):
+        state["page"] += 1
+        return True
+    nxt = state["page"] + 1
+    if _click_and_wait_change(page, "page", nxt):
+        state["page"] = nxt
+        return True
+    return False
+
+
+def go_first_page(page):
+    """กลับหน้าแรก (หลังสลับ Volume/Value บางหน้าเว็บคงเลขหน้าเดิมไว้)"""
+    _click_and_wait_change(page, "page", 1)
+    for _ in range(MAX_PAGES):
+        if not _click_and_wait_change(page, "prev"):
+            break
+
+
+def collect_view(page):
+    """เก็บทุกหน้าของมุมมองปัจจุบัน คืนค่า (dict หุ้น, หัวตาราง, จำนวนรอบเลื่อน, จำนวนครั้งที่ไปหน้าถัดไป)"""
+    seen, head, steps, pages = {}, "", 0, 0
+    state = {"page": 1}
+    while True:
+        page.evaluate(JS_SCROLL_TOP)
+        page.wait_for_timeout(500)
+        h, s = _scroll_collect(page, seen)
+        head = h or head
+        steps += s
+        if pages >= MAX_PAGES or not advance_page(page, state):
+            break
+        pages += 1
+    return seen, head, steps, pages
 
 
 def fetch_nvdr_data():
     """คืนค่า (date_str 'dd/mm/yyyy', rows, info)"""
+    diag = ""
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         page = browser.new_page(viewport={"width": 1600, "height": 1400})
@@ -393,13 +527,18 @@ def fetch_nvdr_data():
             as_of = parse_as_of(page.evaluate("() => document.body.innerText || ''"))
 
             ensure_view(page, "Volume")
-            vol, vol_head, vol_steps = collect_view(page)
+            vol, vol_head, vol_steps, vol_pages = collect_view(page)
             check_head(vol_head, "Volume")
 
             ensure_view(page, "Value")
-            val, val_head, val_steps = collect_view(page)
+            go_first_page(page)
+            val, val_head, val_steps, val_pages = collect_view(page)
             check_head(val_head, "Value")
 
+            try:
+                diag = page.evaluate(JS_DIAG_BELOW) or ""
+            except Exception:
+                diag = ""
             if as_of is None:
                 as_of = parse_as_of(page.evaluate("() => document.body.innerText || ''"))
         finally:
@@ -408,6 +547,9 @@ def fetch_nvdr_data():
     if as_of is None:
         raise ValueError("หาข้อความ 'As of dd Mon yyyy' บนหน้าเว็บไม่เจอ")
     sanity_check(vol, val)
+    if vol_pages == 0 and val_pages == 0 and len(vol) in SUSPICIOUS_ROUND_COUNTS:
+        raise ValueError(f"เก็บได้ {len(vol)} หุ้นพอดี (ตัวเลขกลม) และไม่พบปุ่มหน้าถัดไป/โหลดเพิ่ม "
+                         f"น่าจะเป็นแค่หน้าแรกของตารางที่แบ่งหน้า ไม่บันทึก | HTML ใต้ตาราง: {diag}")
     bad = check_alignment(vol, val)
     vol_n = {s: v[0] for s, v in vol.items()}
     val_n = {s: v[0] for s, v in val.items()}
@@ -416,7 +558,7 @@ def fetch_nvdr_data():
     rows = merge_views(vol_n, vm, val_n, am)
     info = (f"{len(rows)} หุ้น (Volume {len(vol_n)}/Value {len(val_n)}) "
             f"แรก={rows[0][0]} ท้าย={rows[-1][0]} หน่วย x{vm}/x{am} "
-            f"ไม่เข้าสูตร {bad} แถว เลื่อน {vol_steps}+{val_steps} รอบ")
+            f"ไม่เข้าสูตร {bad} แถว หน้า {vol_pages + 1}+{val_pages + 1} เลื่อน {vol_steps}+{val_steps} รอบ")
     return as_of.strftime("%d/%m/%Y"), rows, info
 
 
@@ -476,6 +618,7 @@ def style_headers(ws):
 
 
 def push_to_log(sh, date_str, time_str, workflow_name, trigger_label, status, rows_sent, detail=""):
+    detail = f"[{SCRIPT_NAME} v{__version__}] {detail}".strip()
     ws = get_or_create_worksheet(sh, LOG_SHEET_NAME, rows=2000, cols=10)
     if len(ws.get_all_values()) == 0:
         ws.append_row(LOG_HEADERS, value_input_option="USER_ENTERED", table_range="A1")
@@ -492,7 +635,7 @@ def capture_once():
     time_str = now.strftime("%H:%M")
     trigger_label = get_trigger_label()
     workflow_name = get_workflow_name()
-    print(f"[{date_str} {time_str} เวลาไทย] เริ่ม capture NVDR Trading by Stock "
+    print(f"[{date_str} {time_str} เวลาไทย] เริ่ม {SCRIPT_NAME} v{__version__} "
           f"(workflow: {workflow_name}, trigger: {trigger_label})")
 
     sh = get_open_spreadsheet()
@@ -508,6 +651,10 @@ def capture_once():
 
     ws = get_or_create_worksheet(sh, NVDR_SHEET_NAME, rows=len(rows) + 1000, cols=15)
     existing = ws.get_all_values()
+    if os.environ.get("NVDR_RESET_TAB", "false").strip().lower() == "true" and existing:
+        ws.clear()
+        existing = []
+        print("  ล้างข้อมูลเดิมในแท็บ NVDRTradingByStock ตามที่เลือก reset_tab = true")
     try:
         if not existing:
             ws.append_rows([NVDR_GROUP_ROW, NVDR_COL_ROW], value_input_option="USER_ENTERED",
