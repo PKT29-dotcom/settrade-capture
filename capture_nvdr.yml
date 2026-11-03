@@ -6,7 +6,13 @@ on:
     # วันทำการก่อนหน้า (ภาพหน้าเว็บตอน 08:22 ยังโชว์ข้อมูลของวันก่อน) จึงได้ข้อมูลที่ครบแล้ว
     # script ใช้วันที่ "As of" ในไฟล์เป็น Date และข้ามถ้ามีวันที่นั้นแล้ว รันซ้ำได้ปลอดภัย
     - cron: '40 1 * * 1-5'
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      reset_tab:
+        description: 'true = ล้างข้อมูลเดิมในแท็บ NVDRTradingByStock ก่อนบันทึก (ใช้ตอนเปลี่ยนรูปแบบ) / false = ปกติ'
+        type: choice
+        options: ['false', 'true']
+        default: 'false'
 
 jobs:
   capture:
@@ -35,6 +41,7 @@ jobs:
         env:
           GSHEET_ID: ${{ secrets.GSHEET_ID }}
           GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/gcp-credentials.json
+          NVDR_RESET_TAB: ${{ inputs.reset_tab || 'false' }}
         run: python capture_nvdr.py
 
       - name: Remove credentials file
