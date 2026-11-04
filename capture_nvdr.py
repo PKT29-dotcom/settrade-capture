@@ -1,5 +1,5 @@
 """
-Capture NVDR  v1.1.0  (capture_nvdr.py)
+Capture NVDR  v1.1.1  (capture_nvdr.py)
 ------------------------------------------------------------------
 Capture NVDR Trading by Stock (รายหุ้น) จาก set.or.th แล้ว append เข้าแท็บ
 NVDRTradingByStock ใน Google Sheet "Settrade Capture Log"
@@ -24,6 +24,8 @@ Environment variables:
     NVDR_RESET_TAB   (ไม่บังคับ) = true ล้างข้อมูลเดิมในแท็บก่อนบันทึก
 
 Changelog (เพิ่มเวอร์ชันทุกครั้งที่แก้ไฟล์นี้ และเวอร์ชันจะแสดงใน Log คอลัมน์ Detail):
+  1.1.1  ตัวตรวจหัวตารางไม่สนตัวพิมพ์เล็ก-ใหญ่/ช่องว่าง/เครื่องหมาย * และเมื่อหยุดเพราะแท็บเป็น
+         รูปแบบเก่า จะแจ้งใน Log ว่าเจอแถวที่ 1-2 เป็นอะไร (ไว้ดูว่าทำไมถึงไม่ตรง)
   1.1.0  อ่านตารางจากหน้าเว็บ (เลิกใช้ Export Excel), จัดช่องตามสูตร Total=Buy+Sell /
          Net=Buy-Sell, หัวตาราง 2 แถว ไม่มีคอลัมน์ Trigger, รองรับตารางที่แบ่งหน้า
          (ปุ่ม Next / เลขหน้า / Load more), ตัวเลือก reset_tab, แสดงเวอร์ชันใน Log
@@ -43,7 +45,7 @@ from google.oauth2.service_account import Credentials
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
 SCRIPT_NAME = "Capture NVDR"
-__version__ = "1.1.0"
+__version__ = "1.1.1"
 
 BANGKOK_TZ = ZoneInfo("Asia/Bangkok")
 
@@ -597,6 +599,10 @@ def get_or_create_worksheet(sh, title: str, rows: int, cols: int):
         raise
 
 
+def _norm_cell(c) -> str:
+    return re.sub(r"[\s*]", "", c or "").lower()
+
+
 def date_already_captured(values, date_str: str) -> bool:
     return date_str in {(r[0] if r else "").lstrip("'").strip() for r in values}
 
@@ -660,9 +666,13 @@ def capture_once():
             ws.append_rows([NVDR_GROUP_ROW, NVDR_COL_ROW], value_input_option="USER_ENTERED",
                            table_range="A1")
             style_headers(ws)
-        elif [c.strip() for c in (existing[1] if len(existing) > 1 else [])][:12] != NVDR_COL_ROW:
+        elif [_norm_cell(c) for c in (existing[1] if len(existing) > 1 else [])][:12] \
+                != [_norm_cell(c) for c in NVDR_COL_ROW]:
+            found = " || ".join(",".join(r[:5]) for r in existing[:2])
             raise ValueError(f"แท็บ {NVDR_SHEET_NAME} มีข้อมูลรูปแบบเก่า (ไม่มีหัวตาราง 2 แถวตามรูปแบบใหม่) "
-                             "กรุณาลบข้อมูลทั้งหมดในแท็บนี้ก่อน แล้วรันใหม่")
+                             "กรุณาลบข้อมูลทั้งหมดในแท็บนี้ก่อน แล้วรันใหม่ "
+                             f"หรือกด Run workflow โดยเลือก reset_tab = true | แท็บมี {len(existing)} แถว "
+                             f"แถวที่ 1-2 คือ: {found[:160]}")
     except Exception as e:
         detail = f"{type(e).__name__}: {str(e)[:900]}"
         push_to_log(sh, date_str, time_str, workflow_name, trigger_label, "Failed", 0, detail)
