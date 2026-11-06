@@ -1,5 +1,5 @@
 """
-Capture NVDR  v1.1.1  (capture_nvdr.py)
+Capture NVDR  v1.1.2  (capture_nvdr.py)
 ------------------------------------------------------------------
 Capture NVDR Trading by Stock (รายหุ้น) จาก set.or.th แล้ว append เข้าแท็บ
 NVDRTradingByStock ใน Google Sheet "Settrade Capture Log"
@@ -24,6 +24,8 @@ Environment variables:
     NVDR_RESET_TAB   (ไม่บังคับ) = true ล้างข้อมูลเดิมในแท็บก่อนบันทึก
 
 Changelog (เพิ่มเวอร์ชันทุกครั้งที่แก้ไฟล์นี้ และเวอร์ชันจะแสดงใน Log คอลัมน์ Detail):
+  1.1.2  ลองใหม่อัตโนมัติเมื่อเชื่อมต่อ Google Sheets หลุดชั่วคราว (RemoteDisconnected /
+         429 / 5xx) และกันการเขียนซ้ำถ้าข้อมูลเข้าไปแล้วแต่คำตอบหาย
   1.1.1  ตัวตรวจหัวตารางไม่สนตัวพิมพ์เล็ก-ใหญ่/ช่องว่าง/เครื่องหมาย * และเมื่อหยุดเพราะแท็บเป็น
          รูปแบบเก่า จะแจ้งใน Log ว่าเจอแถวที่ 1-2 เป็นอะไร (ไว้ดูว่าทำไมถึงไม่ตรง)
   1.1.0  อ่านตารางจากหน้าเว็บ (เลิกใช้ Export Excel), จัดช่องตามสูตร Total=Buy+Sell /
@@ -36,16 +38,18 @@ import os
 import re
 import sys
 import numbers
+import time
 import traceback
 import datetime as dt
 from zoneinfo import ZoneInfo
 
 import gspread
+import requests
 from google.oauth2.service_account import Credentials
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
 SCRIPT_NAME = "Capture NVDR"
-__version__ = "1.1.1"
+__version__ = "1.1.2"
 
 BANGKOK_TZ = ZoneInfo("Asia/Bangkok")
 
@@ -565,6 +569,57 @@ def fetch_nvdr_data():
 
 
 # ---------- Google Sheets ----------
+RETRY_ATTEMPTS = 5
+RETRY_BASE_DELAY = 2
+
+
+def _is_transient(e) -> bool:
+    """ข้อผิดพลาดชั่วคราวที่ควรลองใหม่ (เชื่อมต่อหลุด, หมดเวลา, 429, 5xx)"""
+    if isinstance(e, (requests.exceptions.ConnectionError, requests.exceptions.Timeout,
+                      requests.exceptions.ChunkedEncodingError, ConnectionError, TimeoutError)):
+        return True
+    if isinstance(e, gspread.exceptions.APIError):
+        code = getattr(getattr(e, "response", None), "status_code", None)
+        return code in (429, 500, 502, 503, 504)
+    return False
+
+
+def _backoff(attempt: int, e) -> None:
+    delay = min(RETRY_BASE_DELAY * 2 ** (attempt - 1), 30)
+    print(f"  คำเตือน: เชื่อมต่อ Google Sheets ไม่สำเร็จ ({type(e).__name__}) "
+          f"ลองใหม่ครั้งที่ {attempt + 1}/{RETRY_ATTEMPTS} ใน {delay} วินาที")
+    time.sleep(delay)
+
+
+def call_with_retry(fn, *args, **kwargs):
+    for attempt in range(1, RETRY_ATTEMPTS + 1):
+        try:
+            return fn(*args, **kwargs)
+        except Exception as e:
+            if not _is_transient(e) or attempt == RETRY_ATTEMPTS:
+                raise
+            _backoff(attempt, e)
+
+
+def append_safe(ws, rows, already_done):
+    """เพิ่มแถวแบบกันซ้ำ: ถ้าเชื่อมต่อหลุด จะอ่านชีทดูก่อนว่ารอบที่แล้วเขียนเข้าไปแล้วหรือยัง
+    (already_done = ฟังก์ชันรับค่าที่อ่านจากชีท คืน True ถ้าข้อมูลชุดนี้อยู่ในชีทแล้ว)"""
+    for attempt in range(1, RETRY_ATTEMPTS + 1):
+        try:
+            ws.append_rows(rows, value_input_option="USER_ENTERED", table_range="A1")
+            return
+        except Exception as e:
+            if not _is_transient(e) or attempt == RETRY_ATTEMPTS:
+                raise
+            _backoff(attempt, e)
+            try:
+                if already_done(call_with_retry(ws.get_all_values)):
+                    print("  ตรวจพบว่าข้อมูลถูกเขียนสำเร็จไปแล้วก่อนเชื่อมต่อหลุด ไม่เขียนซ้ำ")
+                    return
+            except Exception:
+                pass
+
+
 def get_open_spreadsheet():
     sheet_id = os.environ.get("GSHEET_ID")
     creds_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
@@ -572,7 +627,7 @@ def get_open_spreadsheet():
         raise RuntimeError("ไม่พบ GSHEET_ID หรือ GOOGLE_APPLICATION_CREDENTIALS ใน environment variables")
     scopes = ["https://www.googleapis.com/auth/spreadsheets"]
     creds = Credentials.from_service_account_file(creds_path, scopes=scopes)
-    return gspread.authorize(creds).open_by_key(sheet_id)
+    return call_with_retry(gspread.authorize(creds).open_by_key, sheet_id)
 
 
 def get_or_create_worksheet(sh, title: str, rows: int, cols: int):
@@ -580,7 +635,7 @@ def get_or_create_worksheet(sh, title: str, rows: int, cols: int):
         return re.sub(r"[^a-zA-Z0-9]", "", s).lower()
 
     def find():
-        for ws in sh.worksheets():
+        for ws in call_with_retry(sh.worksheets):
             if norm(ws.title) == norm(title):
                 return ws
         return None
@@ -589,7 +644,7 @@ def get_or_create_worksheet(sh, title: str, rows: int, cols: int):
     if ws:
         return ws
     try:
-        return sh.add_worksheet(title=title, rows=rows, cols=cols)
+        return call_with_retry(sh.add_worksheet, title=title, rows=rows, cols=cols)
     except gspread.exceptions.APIError as e:
         if "already exists" not in str(e):
             raise
@@ -626,9 +681,10 @@ def style_headers(ws):
 def push_to_log(sh, date_str, time_str, workflow_name, trigger_label, status, rows_sent, detail=""):
     detail = f"[{SCRIPT_NAME} v{__version__}] {detail}".strip()
     ws = get_or_create_worksheet(sh, LOG_SHEET_NAME, rows=2000, cols=10)
-    if len(ws.get_all_values()) == 0:
-        ws.append_row(LOG_HEADERS, value_input_option="USER_ENTERED", table_range="A1")
-    ws.append_row(
+    if len(call_with_retry(ws.get_all_values)) == 0:
+        call_with_retry(ws.append_row, LOG_HEADERS, value_input_option="USER_ENTERED", table_range="A1")
+    call_with_retry(
+        ws.append_row,
         [date_str, time_str, workflow_name, trigger_label, status, rows_sent, detail],
         value_input_option="USER_ENTERED",
         table_range="A1",
@@ -655,16 +711,23 @@ def capture_once():
 
     print(f"  ข้อมูลวันที่ {data_date}: {info}")
 
-    ws = get_or_create_worksheet(sh, NVDR_SHEET_NAME, rows=len(rows) + 1000, cols=15)
-    existing = ws.get_all_values()
+    try:
+        ws = get_or_create_worksheet(sh, NVDR_SHEET_NAME, rows=len(rows) + 1000, cols=15)
+        existing = call_with_retry(ws.get_all_values)
+    except Exception as e:
+        detail = f"{type(e).__name__}: {str(e)[:900]}"
+        try:
+            push_to_log(sh, date_str, time_str, workflow_name, trigger_label, "Failed", 0, detail)
+        except Exception:
+            pass
+        raise
     if os.environ.get("NVDR_RESET_TAB", "false").strip().lower() == "true" and existing:
-        ws.clear()
+        call_with_retry(ws.clear)
         existing = []
         print("  ล้างข้อมูลเดิมในแท็บ NVDRTradingByStock ตามที่เลือก reset_tab = true")
     try:
         if not existing:
-            ws.append_rows([NVDR_GROUP_ROW, NVDR_COL_ROW], value_input_option="USER_ENTERED",
-                           table_range="A1")
+            append_safe(ws, [NVDR_GROUP_ROW, NVDR_COL_ROW], bool)
             style_headers(ws)
         elif [_norm_cell(c) for c in (existing[1] if len(existing) > 1 else [])][:12] \
                 != [_norm_cell(c) for c in NVDR_COL_ROW]:
@@ -689,7 +752,7 @@ def capture_once():
         return (0 if FILL_ZERO_FOR_BLANK else "") if v is None else v
     out = [[f"'{data_date}", r[0]] + [_cell(v) for v in r[1:]] for r in rows]
     try:
-        ws.append_rows(out, value_input_option="USER_ENTERED", table_range="A1")
+        append_safe(ws, out, lambda vals: date_already_captured(vals, data_date))
     except Exception as e:
         detail = f"{type(e).__name__}: {str(e)[:900]}"
         push_to_log(sh, date_str, time_str, workflow_name, trigger_label, "Failed", 0, detail)
