@@ -1,5 +1,5 @@
 """
-Capture NVDR  v1.1.2  (capture_nvdr.py)
+Capture NVDR  v1.1.3  (capture_nvdr.py)
 ------------------------------------------------------------------
 Capture NVDR Trading by Stock (รายหุ้น) จาก set.or.th แล้ว append เข้าแท็บ
 NVDRTradingByStock ใน Google Sheet "Settrade Capture Log"
@@ -24,6 +24,8 @@ Environment variables:
     NVDR_RESET_TAB   (ไม่บังคับ) = true ล้างข้อมูลเดิมในแท็บก่อนบันทึก
 
 Changelog (เพิ่มเวอร์ชันทุกครั้งที่แก้ไฟล์นี้ และเวอร์ชันจะแสดงใน Log คอลัมน์ Detail):
+  1.1.3  แก้บั๊กตรวจแท็บว่างผิด: gspread คืน [[]] (1 แถวว่าง) เมื่อแท็บว่าง ทำให้เข้าใจว่ามี
+         ข้อมูลเก่า (หยุดด้วย error รูปแบบเก่า) และทำให้ไม่เขียนหัวตารางตอนสร้างแท็บใหม่
   1.1.2  ลองใหม่อัตโนมัติเมื่อเชื่อมต่อ Google Sheets หลุดชั่วคราว (RemoteDisconnected /
          429 / 5xx) และกันการเขียนซ้ำถ้าข้อมูลเข้าไปแล้วแต่คำตอบหาย
   1.1.1  ตัวตรวจหัวตารางไม่สนตัวพิมพ์เล็ก-ใหญ่/ช่องว่าง/เครื่องหมาย * และเมื่อหยุดเพราะแท็บเป็น
@@ -49,7 +51,7 @@ from google.oauth2.service_account import Credentials
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
 SCRIPT_NAME = "Capture NVDR"
-__version__ = "1.1.2"
+__version__ = "1.1.3"
 
 BANGKOK_TZ = ZoneInfo("Asia/Bangkok")
 
@@ -654,6 +656,11 @@ def get_or_create_worksheet(sh, title: str, rows: int, cols: int):
         raise
 
 
+def _is_blank(values) -> bool:
+    """แท็บว่างจริงหรือไม่ (gspread คืน [[]] เมื่อแท็บว่าง ดังนั้นห้ามเช็คจาก len)"""
+    return not any((c or "").strip() for row in values for c in row)
+
+
 def _norm_cell(c) -> str:
     return re.sub(r"[\s*]", "", c or "").lower()
 
@@ -681,7 +688,7 @@ def style_headers(ws):
 def push_to_log(sh, date_str, time_str, workflow_name, trigger_label, status, rows_sent, detail=""):
     detail = f"[{SCRIPT_NAME} v{__version__}] {detail}".strip()
     ws = get_or_create_worksheet(sh, LOG_SHEET_NAME, rows=2000, cols=10)
-    if len(call_with_retry(ws.get_all_values)) == 0:
+    if _is_blank(call_with_retry(ws.get_all_values)):
         call_with_retry(ws.append_row, LOG_HEADERS, value_input_option="USER_ENTERED", table_range="A1")
     call_with_retry(
         ws.append_row,
@@ -721,12 +728,12 @@ def capture_once():
         except Exception:
             pass
         raise
-    if os.environ.get("NVDR_RESET_TAB", "false").strip().lower() == "true" and existing:
+    if os.environ.get("NVDR_RESET_TAB", "false").strip().lower() == "true" and not _is_blank(existing):
         call_with_retry(ws.clear)
         existing = []
         print("  ล้างข้อมูลเดิมในแท็บ NVDRTradingByStock ตามที่เลือก reset_tab = true")
     try:
-        if not existing:
+        if _is_blank(existing):
             append_safe(ws, [NVDR_GROUP_ROW, NVDR_COL_ROW], bool)
             style_headers(ws)
         elif [_norm_cell(c) for c in (existing[1] if len(existing) > 1 else [])][:12] \
