@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
     inputs:
       reset_tab:
-        description: 'true = ล้างข้อมูลเดิมในแท็บ NVDRTradingByStock ก่อนบันทึก (ใช้ตอนเปลี่ยนรูปแบบ) / false = ปกติ'
+        description: 'true = ล้างเฉพาะแถวข้อมูลในแท็บ NVDRTradingByStock (คงหัวตารางไว้) ก่อนบันทึก / false = ปกติ'
         type: choice
         options: ['false', 'true']
         default: 'false'
