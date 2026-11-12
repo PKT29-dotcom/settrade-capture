@@ -1,5 +1,5 @@
 """
-Capture NVDR  v1.1.3  (capture_nvdr.py)
+Capture NVDR  v1.2.0  (capture_nvdr.py)
 ------------------------------------------------------------------
 Capture NVDR Trading by Stock (รายหุ้น) จาก set.or.th แล้ว append เข้าแท็บ
 NVDRTradingByStock ใน Google Sheet "Settrade Capture Log"
@@ -24,6 +24,8 @@ Environment variables:
     NVDR_RESET_TAB   (ไม่บังคับ) = true ล้างข้อมูลเดิมในแท็บก่อนบันทึก
 
 Changelog (เพิ่มเวอร์ชันทุกครั้งที่แก้ไฟล์นี้ และเวอร์ชันจะแสดงใน Log คอลัมน์ Detail):
+  1.2.0  เพิ่มคอลัมน์ Trigger (Manual / Scheduled) ท้ายตาราง และเติมหัว Trigger ให้เองถ้าหัวตารางที่
+         ทำไว้ไม่มี, ไม่ลบหัวตารางที่ทำไว้เอง (reset_tab ล้างเฉพาะแถวข้อมูล), หาหัวตารางใน 3 แถวแรก
   1.1.3  แก้บั๊กตรวจแท็บว่างผิด: gspread คืน [[]] (1 แถวว่าง) เมื่อแท็บว่าง ทำให้เข้าใจว่ามี
          ข้อมูลเก่า (หยุดด้วย error รูปแบบเก่า) และทำให้ไม่เขียนหัวตารางตอนสร้างแท็บใหม่
   1.1.2  ลองใหม่อัตโนมัติเมื่อเชื่อมต่อ Google Sheets หลุดชั่วคราว (RemoteDisconnected /
@@ -51,7 +53,7 @@ from google.oauth2.service_account import Credentials
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
 SCRIPT_NAME = "Capture NVDR"
-__version__ = "1.1.3"
+__version__ = "1.2.0"
 
 BANGKOK_TZ = ZoneInfo("Asia/Bangkok")
 
@@ -59,9 +61,10 @@ NVDR_URL = "https://www.set.or.th/th/market/statistics/nvdr/trading-by-stock"
 
 NVDR_SHEET_NAME = "NVDRTradingByStock"
 # รูปแบบแท็บให้เหมือนไฟล์ Export จากเว็บ SET (หัว 2 แถว) แต่มี Date และ Symbol นำหน้า
-NVDR_GROUP_ROW = ["", "", "Volume (Share)", "", "", "", "", "Value (Baht)", "", "", "", ""]
+NVDR_GROUP_ROW = ["", "", "Volume (Share)", "", "", "", "", "Value (Baht)", "", "", "", "", ""]
 NVDR_COL_ROW = ["Date", "Symbol", "Buy", "Sell", "Total", "Net", "%*",
-                "Buy", "Sell", "Total", "Net", "%*"]
+                "Buy", "Sell", "Total", "Net", "%*", "Trigger"]
+NVDR_DATA_COLS = 12     # คอลัมน์ Date..%* ที่ใช้ตรวจว่าเป็นหัวตารางของเรา (ไม่รวม Trigger)
 
 # ช่องที่เว็บแสดง "-" (ไม่มีรายการ): False = เว้นว่างเหมือนไฟล์ Export, True = ใส่ 0
 FILL_ZERO_FOR_BLANK = False
@@ -669,13 +672,23 @@ def date_already_captured(values, date_str: str) -> bool:
     return date_str in {(r[0] if r else "").lstrip("'").strip() for r in values}
 
 
+def find_header_row(values):
+    """หาแถวหัวคอลัมน์ (Date, Symbol, Buy, ...) ภายใน 3 แถวแรก คืน index แบบ 0-based หรือ None
+    ไม่สนตัวพิมพ์เล็ก-ใหญ่/ช่องว่าง/เครื่องหมาย * จึงรองรับหัวตารางที่พิมพ์เองด้วย"""
+    want = [_norm_cell(c) for c in NVDR_COL_ROW[:NVDR_DATA_COLS]]
+    for i, row in enumerate(values[:3]):
+        if [_norm_cell(c) for c in row][:NVDR_DATA_COLS] == want:
+            return i
+    return None
+
+
 def style_headers(ws):
     """จัดหัวตาราง 2 แถวให้หน้าตาใกล้ไฟล์ Export (ผสานเซลล์ ตัวหนา สีส้ม ตรึง 2 แถว)
     ถ้าตกแต่งไม่สำเร็จไม่กระทบการบันทึกข้อมูล"""
     try:
         ws.merge_cells("C1:G1")
         ws.merge_cells("H1:L1")
-        ws.format("A1:L2", {
+        ws.format("A1:M2", {
             "textFormat": {"bold": True},
             "horizontalAlignment": "CENTER",
             "backgroundColor": {"red": 0.98, "green": 0.69, "blue": 0.23},
@@ -729,20 +742,36 @@ def capture_once():
             pass
         raise
     if os.environ.get("NVDR_RESET_TAB", "false").strip().lower() == "true" and not _is_blank(existing):
-        call_with_retry(ws.clear)
-        existing = []
-        print("  ล้างข้อมูลเดิมในแท็บ NVDRTradingByStock ตามที่เลือก reset_tab = true")
+        hdr = find_header_row(existing)
+        if hdr is None:
+            call_with_retry(ws.clear)
+            existing = []
+            print("  ล้างแท็บทั้งหมดตามที่เลือก reset_tab = true (ไม่พบหัวตารางเดิม)")
+        else:
+            # ล้างเฉพาะแถวข้อมูล คงหัวตารางที่ทำไว้ (ทั้งที่พิมพ์เองและที่ script สร้าง)
+            call_with_retry(ws.batch_clear, [f"A{hdr + 2}:ZZ"])
+            existing = call_with_retry(ws.get_all_values)
+            print("  ล้างเฉพาะแถวข้อมูล คงหัวตารางไว้ ตามที่เลือก reset_tab = true")
     try:
         if _is_blank(existing):
             append_safe(ws, [NVDR_GROUP_ROW, NVDR_COL_ROW], bool)
             style_headers(ws)
-        elif [_norm_cell(c) for c in (existing[1] if len(existing) > 1 else [])][:12] \
-                != [_norm_cell(c) for c in NVDR_COL_ROW]:
-            found = " || ".join(",".join(r[:5]) for r in existing[:2])
-            raise ValueError(f"แท็บ {NVDR_SHEET_NAME} มีข้อมูลรูปแบบเก่า (ไม่มีหัวตาราง 2 แถวตามรูปแบบใหม่) "
-                             "กรุณาลบข้อมูลทั้งหมดในแท็บนี้ก่อน แล้วรันใหม่ "
-                             f"หรือกด Run workflow โดยเลือก reset_tab = true | แท็บมี {len(existing)} แถว "
-                             f"แถวที่ 1-2 คือ: {found[:160]}")
+        else:
+            hdr = find_header_row(existing)
+            if hdr is None:
+                found = " || ".join(",".join(r[:5]) for r in existing[:3])
+                raise ValueError(f"ไม่พบหัวตาราง (Date, Symbol, Buy, Sell, Total, Net, %*, ...) ใน 3 แถวแรกของแท็บ "
+                                 f"{NVDR_SHEET_NAME} (น่าจะเป็นข้อมูลรูปแบบเก่า) กรุณาลบข้อมูลในแท็บนี้ก่อน "
+                                 f"หรือกด Run workflow โดยเลือก reset_tab = true | แท็บมี {len(existing)} แถว "
+                                 f"3 แถวแรกคือ: {found[:160]}")
+            row = existing[hdr]
+            if len(row) < len(NVDR_COL_ROW) or _norm_cell(row[len(NVDR_COL_ROW) - 1]) != "trigger":
+                # หัวตารางที่ทำไว้เองยังไม่มีคอลัมน์ Trigger: เติมให้ โดยไม่แตะส่วนอื่น
+                call_with_retry(ws.update_acell, f"M{hdr + 1}", "Trigger")
+                try:
+                    ws.format(f"M{hdr + 1}", {"textFormat": {"bold": True}, "horizontalAlignment": "CENTER"})
+                except Exception:
+                    pass
     except Exception as e:
         detail = f"{type(e).__name__}: {str(e)[:900]}"
         push_to_log(sh, date_str, time_str, workflow_name, trigger_label, "Failed", 0, detail)
@@ -757,7 +786,7 @@ def capture_once():
     # ขึ้นต้นด้วย ' ให้ Sheets เก็บวันที่เป็นข้อความล้วน (เหมือน SectorIndex)
     def _cell(v):
         return (0 if FILL_ZERO_FOR_BLANK else "") if v is None else v
-    out = [[f"'{data_date}", r[0]] + [_cell(v) for v in r[1:]] for r in rows]
+    out = [[f"'{data_date}", r[0]] + [_cell(v) for v in r[1:]] + [trigger_label] for r in rows]
     try:
         append_safe(ws, out, lambda vals: date_already_captured(vals, data_date))
     except Exception as e:
