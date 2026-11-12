@@ -85,6 +85,9 @@ EN_MONTHS = {
 # ต้องเริ่มค้นหลังคำว่า Trading Summary เพราะก่อนหน้านั้นมี As of ของดัชนี SETTRI (วันก่อน)
 ASOF_AFTER_SUMMARY_RE = re.compile(
     r"Trading Summary.*?As of\s+(\d{1,2})\s+([A-Za-z]{3,9})\s+(\d{4})", re.S)
+# แบบแม่นที่สุด: วันที่อยู่ติดแท็บ "Accumulated Trading Summary" ของกล่องเดียวกันเลย
+ASOF_ACCUM_RE = re.compile(
+    r"Accumulated Trading Summary\s+As of\s+(\d{1,2})\s+([A-Za-z]{3,9})\s+(\d{4})")
 LAST_UPDATE_RE = re.compile(r"Last Update\s+(\d{1,2})\s+([A-Za-z]{3,9})\s+(\d{4})")
 DATE_CELL_FORMATS = ("%d/%m/%Y", "%Y-%m-%d", "%d %b %Y", "%d-%m-%Y")
 
@@ -101,11 +104,12 @@ def _make_date(day, mon, year):
 
 def extract_as_of(body_text: str):
     """วันที่ของข้อมูลบนหน้า SET: ใช้ As of ใต้ Trading Summary ก่อน ถ้าไม่เจอใช้ Last Update"""
-    m = ASOF_AFTER_SUMMARY_RE.search(body_text or "")
-    if m:
-        d = _make_date(*m.groups())
-        if d:
-            return d
+    for pattern in (ASOF_ACCUM_RE, ASOF_AFTER_SUMMARY_RE):
+        m = pattern.search(body_text or "")
+        if m:
+            d = _make_date(*m.groups())
+            if d:
+                return d
     m = LAST_UPDATE_RE.search(body_text or "")
     return _make_date(*m.groups()) if m else None
 
