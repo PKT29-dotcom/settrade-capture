@@ -1,4 +1,4 @@
-name: StockDailyDetail
+name: Capture StockDailyDetail
 
 on:
   schedule:
