@@ -1,5 +1,5 @@
 """
-capture_settrade.py
+Capture Settrade (TopDatabase)  v1.1.0  (capture_settrade.py)
 --------------------
 Capture ข้อมูล 4 ตารางในแท็บ "ภาพรวม Top 20" ของหน้า
 https://www.settrade.com/th/equities/market-summary/top-ranking/overview
@@ -45,9 +45,15 @@ Environment variables ที่ต้องตั้ง (ตั้งผ่า�
     export GSHEET_ID="....."
     export GOOGLE_APPLICATION_CREDENTIALS="./gcp-credentials.json"
     python capture_settrade.py
+
+Changelog (เพิ่มเวอร์ชันทุกครั้งที่แก้ไฟล์นี้ และเวอร์ชันจะแสดงใน Log คอลัมน์ Detail):
+  1.1.0  ลองใหม่อัตโนมัติเมื่อเชื่อมต่อ Google Sheets หลุดชั่วคราว (กันเขียนซ้ำด้วยการตรวจ slot
+         เวลา), แสดงเวอร์ชันใน Log (ก่อนหน้านี้ไม่มีเลขเวอร์ชัน = 1.0.0 รวมการแก้เช็ควันหยุด
+         ตลาด, ช่วงเวลา Range Time และการตรวจ slot ซ้ำ)
 """
 
 import os
+import time
 import io
 import sys
 import traceback
@@ -56,10 +62,14 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 import gspread
+import requests
 from google.oauth2.service_account import Credentials
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
 from market_holidays import is_market_holiday
+
+SCRIPT_NAME = "Capture Settrade (TopDatabase)"
+__version__ = "1.1.0"
 
 BANGKOK_TZ = ZoneInfo("Asia/Bangkok")
 
@@ -144,27 +154,16 @@ def slot_for_time(time_str: str, strict: bool = True):
     return min(SLOT_RANGES, key=lambda r: abs(_time_to_minutes(r[0]) - minutes))[0]
 
 
-def slot_already_captured_today(sh, date_str: str, slot: str) -> bool:
-    """
-    เช็คว่าวันนี้ (date_str) มีข้อมูลของ slot นี้ใน TopDatabase อยู่แล้วหรือยัง
-    ถ้าโหลด TopDatabase ไม่สำเร็จ จะคืนค่า False (ไม่บล็อกการ capture)
-    """
-    try:
-        ws = sh.worksheet(MASTER_SHEET_NAME)
-        all_values = ws.get_all_values()
-    except Exception:
-        return False
-
+def slot_in_values(all_values, date_str: str, slot: str) -> bool:
+    """เช็คจากค่าที่อ่านจากแท็บมาแล้วว่ามีข้อมูลของ slot นี้ในวันนี้หรือยัง"""
     if len(all_values) < 2:
         return False
-
     header = all_values[0]
     try:
         date_idx = header.index("Date")
         time_idx = header.index("Time")
     except ValueError:
         return False
-
     for row in all_values[1:]:
         if len(row) <= max(date_idx, time_idx):
             continue
@@ -175,11 +174,103 @@ def slot_already_captured_today(sh, date_str: str, slot: str) -> bool:
     return False
 
 
+def slot_already_captured_today(sh, date_str: str, slot: str) -> bool:
+    """
+    เช็คว่าวันนี้ (date_str) มีข้อมูลของ slot นี้ใน TopDatabase อยู่แล้วหรือยัง
+    ถ้าโหลด TopDatabase ไม่สำเร็จ จะคืนค่า False (ไม่บล็อกการ capture)
+    """
+    try:
+        ws = sh.worksheet(MASTER_SHEET_NAME)
+        all_values = ws.get_all_values()
+    except Exception:
+        return False
+    return slot_in_values(all_values, date_str, slot)
+
+
 # แท็บเก็บประวัติการรันทุกครั้ง (แยกจากข้อมูล Master) ไว้ตรวจสอบว่า schedule
 # ทำงานตรงเวลาไหม รอบไหน fail บ้าง เพื่อวิเคราะห์ปัญหาความล่าช้าของ
 # GitHub Actions schedule ได้ง่ายขึ้น
 LOG_SHEET_NAME = "Log"
 LOG_HEADERS = ["Date", "Time", "Workflow", "Trigger", "Status", "RowsSent", "Detail"]
+
+
+# ---------- ลองใหม่อัตโนมัติเมื่อเชื่อมต่อ Google Sheets หลุดชั่วคราว ----------
+RETRY_ATTEMPTS = 5
+RETRY_BASE_DELAY = 2
+
+
+def _is_transient(e) -> bool:
+    """ข้อผิดพลาดชั่วคราวที่ควรลองใหม่ (เชื่อมต่อหลุด, หมดเวลา, 429, 5xx)"""
+    if isinstance(e, (requests.exceptions.ConnectionError, requests.exceptions.Timeout,
+                      requests.exceptions.ChunkedEncodingError, ConnectionError, TimeoutError)):
+        return True
+    if isinstance(e, gspread.exceptions.APIError):
+        code = getattr(getattr(e, "response", None), "status_code", None)
+        return code in (429, 500, 502, 503, 504)
+    return False
+
+
+def _backoff(attempt: int, e) -> None:
+    delay = min(RETRY_BASE_DELAY * 2 ** (attempt - 1), 30)
+    print(f"  คำเตือน: เชื่อมต่อ Google Sheets ไม่สำเร็จ ({type(e).__name__}) "
+          f"ลองใหม่ครั้งที่ {attempt + 1}/{RETRY_ATTEMPTS} ใน {delay} วินาที")
+    time.sleep(delay)
+
+
+def call_with_retry(fn, *args, **kwargs):
+    for attempt in range(1, RETRY_ATTEMPTS + 1):
+        try:
+            return fn(*args, **kwargs)
+        except Exception as e:
+            if not _is_transient(e) or attempt == RETRY_ATTEMPTS:
+                raise
+            _backoff(attempt, e)
+
+
+def append_safe(ws, rows, already_done):
+    """เพิ่มแถวแบบกันซ้ำ: ถ้าเชื่อมต่อหลุด จะอ่านชีทดูก่อนว่ารอบที่แล้วเขียนเข้าไปแล้วหรือยัง
+    (already_done = ฟังก์ชันรับค่าที่อ่านจากชีท คืน True ถ้าข้อมูลชุดนี้อยู่ในชีทแล้ว)"""
+    for attempt in range(1, RETRY_ATTEMPTS + 1):
+        try:
+            ws.append_rows(rows, value_input_option="USER_ENTERED", table_range="A1")
+            return
+        except Exception as e:
+            if not _is_transient(e) or attempt == RETRY_ATTEMPTS:
+                raise
+            _backoff(attempt, e)
+            try:
+                if already_done(call_with_retry(ws.get_all_values)):
+                    print("  ตรวจพบว่าข้อมูลถูกเขียนสำเร็จไปแล้วก่อนเชื่อมต่อหลุด ไม่เขียนซ้ำ")
+                    return
+            except Exception:
+                pass
+
+
+def _is_sheet_like(x) -> bool:
+    return hasattr(x, "get_all_values") or hasattr(x, "worksheets")
+
+
+class _Retrying:
+    """ครอบ Spreadsheet/Worksheet ของ gspread: ทุกเมธอดที่ติดต่อ Google จะลองใหม่เมื่อหลุดชั่วคราว
+    ยกเว้น append_row/append_rows ที่ลองซ้ำแบบสุ่มสี่สุ่มห้าไม่ได้ (เสี่ยงข้อมูลซ้ำ) ให้ใช้ append_safe"""
+    _NO_BLIND_RETRY = {"append_row", "append_rows"}
+
+    def __init__(self, obj):
+        object.__setattr__(self, "_obj", obj)
+
+    def __getattr__(self, name):
+        attr = getattr(self._obj, name)
+        if not callable(attr):
+            return attr
+
+        def call(*args, **kwargs):
+            res = attr(*args, **kwargs) if name in self._NO_BLIND_RETRY else call_with_retry(attr, *args, **kwargs)
+            if _is_sheet_like(res):
+                return _Retrying(res)
+            if isinstance(res, list) and res and all(_is_sheet_like(w) for w in res):
+                return [_Retrying(w) for w in res]
+            return res
+        return call
 
 
 def get_visibility_status(page):
@@ -444,7 +535,7 @@ def push_to_master(sh, results, date_str: str, time_str: str, trigger_label: str
         ws = sh.worksheet(MASTER_SHEET_NAME)
     except gspread.WorksheetNotFound:
         ws = sh.add_worksheet(title=MASTER_SHEET_NAME, rows=2000, cols=15)
-        ws.append_row(MASTER_HEADERS, value_input_option="USER_ENTERED", table_range="A1")
+        call_with_retry(ws.append_row, MASTER_HEADERS, value_input_option="USER_ENTERED", table_range="A1")
 
     existing_row_count = len(ws.get_all_values())
     start_row = existing_row_count + 1
@@ -482,7 +573,8 @@ def push_to_master(sh, results, date_str: str, time_str: str, trigger_label: str
         print("  ไม่มีแถวข้อมูลจะส่งเข้า Master")
         return
 
-    ws.append_rows(rows_to_append, value_input_option="USER_ENTERED", table_range="A1")
+    this_slot = slot_for_time(time_str, strict=False)
+    append_safe(ws, rows_to_append, lambda vals: slot_in_values(vals, date_str, this_slot))
     print(f"  ส่ง {len(rows_to_append)} แถว เข้า worksheet '{MASTER_SHEET_NAME}'")
 
 
@@ -505,13 +597,15 @@ def push_to_log(sh, date_str: str, time_str: str, workflow_name: str, trigger_la
     คอลัมน์ Workflow บอกว่าแถวนี้มาจาก workflow ไหน (เพราะ Log แท็บนี้ใช้ร่วมกัน
     ทั้ง capture_settrade.py, capture_setoverview.py, capture_sectorindex.py)
     """
+    detail = f"[{SCRIPT_NAME} v{__version__}] {detail}".strip()
     try:
         ws = sh.worksheet(LOG_SHEET_NAME)
     except gspread.WorksheetNotFound:
         ws = sh.add_worksheet(title=LOG_SHEET_NAME, rows=2000, cols=10)
-        ws.append_row(LOG_HEADERS, value_input_option="USER_ENTERED", table_range="A1")
+        call_with_retry(ws.append_row, LOG_HEADERS, value_input_option="USER_ENTERED", table_range="A1")
 
-    ws.append_row(
+    call_with_retry(
+        ws.append_row,
         [date_str, time_str, workflow_name, trigger_label, status, rows_sent, detail],
         value_input_option="USER_ENTERED",
         table_range="A1",
@@ -532,7 +626,7 @@ def get_open_spreadsheet():
     scopes = ["https://www.googleapis.com/auth/spreadsheets"]
     creds = Credentials.from_service_account_file(creds_path, scopes=scopes)
     gc = gspread.authorize(creds)
-    return gc.open_by_key(sheet_id)
+    return _Retrying(call_with_retry(gc.open_by_key, sheet_id))
 
 
 def get_trigger_label() -> str:
@@ -586,7 +680,7 @@ def capture_once():
                     f"มีข้อมูลของช่วงเวลา {current_slot} ของวันนี้อยู่แล้วใน TopDatabase")
         return
 
-    print(f"[{date_str} {time_str} เวลาไทย] เริ่ม capture ข้อมูลจาก {BASE_URL} "
+    print(f"[{date_str} {time_str} เวลาไทย] เริ่ม {SCRIPT_NAME} v{__version__} จาก {BASE_URL} "
           f"(workflow: {workflow_name}, trigger: {trigger_label})")
 
     try:
