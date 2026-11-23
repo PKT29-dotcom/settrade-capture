@@ -1,5 +1,5 @@
 """
-sync_setdatabase.py
+Sync SetDatabase  v1.1.0  (sync_setdatabase.py)
 ---------------------
 Copy ข้อมูลจากแท็บ SetDatabase ในชีท "Settrade Capture Log" (ต้นทาง) ไปวางที่
 แท็บ "SetDatabase schedule" ในชีทของอีก Google Account (ปลายทาง)
@@ -25,9 +25,16 @@ Environment variables ที่ต้องตั้ง (ใช้ secrets ช�
     export TARGET_GSHEET_ID="....."
     export GOOGLE_APPLICATION_CREDENTIALS="./gcp-credentials.json"
     python sync_setdatabase.py
+
+Changelog (เพิ่มเวอร์ชันทุกครั้งที่แก้ไฟล์นี้ และเวอร์ชันจะแสดงใน Log คอลัมน์ Detail):
+  1.1.0  ลองใหม่อัตโนมัติเมื่อเชื่อมต่อ Google Sheets หลุดชั่วคราว, ถ้าแท็บต้นทางว่างจะไม่ sync
+         (กันล้างแท็บปลายทางทิ้ง) และบันทึก NoData, แสดงเวอร์ชันใน Log, เขียนหัวตาราง Log ให้
+         ถ้าแท็บ Log ว่าง
+  1.0.0  เวอร์ชันเดิม (ไม่มีเลขเวอร์ชัน)
 """
 
 import os
+import time
 import re
 import sys
 import traceback
@@ -35,6 +42,7 @@ import datetime as dt
 from zoneinfo import ZoneInfo
 
 import gspread
+import requests
 from google.oauth2.service_account import Credentials
 
 BANGKOK_TZ = ZoneInfo("Asia/Bangkok")
@@ -44,6 +52,93 @@ TARGET_SHEET_NAME = "SetDatabase Schedule"
 
 LOG_SHEET_NAME = "Log"
 LOG_HEADERS = ["Date", "Time", "Workflow", "Trigger", "Status", "RowsSent", "Detail"]
+
+
+SCRIPT_NAME = "Sync SetDatabase"
+__version__ = "1.1.0"
+
+# ---------- ลองใหม่อัตโนมัติเมื่อเชื่อมต่อ Google Sheets หลุดชั่วคราว ----------
+RETRY_ATTEMPTS = 5
+RETRY_BASE_DELAY = 2
+
+
+def _is_transient(e) -> bool:
+    """ข้อผิดพลาดชั่วคราวที่ควรลองใหม่ (เชื่อมต่อหลุด, หมดเวลา, 429, 5xx)"""
+    if isinstance(e, (requests.exceptions.ConnectionError, requests.exceptions.Timeout,
+                      requests.exceptions.ChunkedEncodingError, ConnectionError, TimeoutError)):
+        return True
+    if isinstance(e, gspread.exceptions.APIError):
+        code = getattr(getattr(e, "response", None), "status_code", None)
+        return code in (429, 500, 502, 503, 504)
+    return False
+
+
+def _backoff(attempt: int, e) -> None:
+    delay = min(RETRY_BASE_DELAY * 2 ** (attempt - 1), 30)
+    print(f"  คำเตือน: เชื่อมต่อ Google Sheets ไม่สำเร็จ ({type(e).__name__}) "
+          f"ลองใหม่ครั้งที่ {attempt + 1}/{RETRY_ATTEMPTS} ใน {delay} วินาที")
+    time.sleep(delay)
+
+
+def call_with_retry(fn, *args, **kwargs):
+    for attempt in range(1, RETRY_ATTEMPTS + 1):
+        try:
+            return fn(*args, **kwargs)
+        except Exception as e:
+            if not _is_transient(e) or attempt == RETRY_ATTEMPTS:
+                raise
+            _backoff(attempt, e)
+
+
+def append_safe(ws, rows, already_done):
+    """เพิ่มแถวแบบกันซ้ำ: ถ้าเชื่อมต่อหลุด จะอ่านชีทดูก่อนว่ารอบที่แล้วเขียนเข้าไปแล้วหรือยัง
+    (already_done = ฟังก์ชันรับค่าที่อ่านจากชีท คืน True ถ้าข้อมูลชุดนี้อยู่ในชีทแล้ว)"""
+    for attempt in range(1, RETRY_ATTEMPTS + 1):
+        try:
+            ws.append_rows(rows, value_input_option="USER_ENTERED", table_range="A1")
+            return
+        except Exception as e:
+            if not _is_transient(e) or attempt == RETRY_ATTEMPTS:
+                raise
+            _backoff(attempt, e)
+            try:
+                if already_done(call_with_retry(ws.get_all_values)):
+                    print("  ตรวจพบว่าข้อมูลถูกเขียนสำเร็จไปแล้วก่อนเชื่อมต่อหลุด ไม่เขียนซ้ำ")
+                    return
+            except Exception:
+                pass
+
+
+def _is_sheet_like(x) -> bool:
+    return hasattr(x, "get_all_values") or hasattr(x, "worksheets")
+
+
+class _Retrying:
+    """ครอบ Spreadsheet/Worksheet ของ gspread: ทุกเมธอดที่ติดต่อ Google จะลองใหม่เมื่อหลุดชั่วคราว
+    ยกเว้น append_row/append_rows ที่ลองซ้ำแบบสุ่มสี่สุ่มห้าไม่ได้ (เสี่ยงข้อมูลซ้ำ) ให้ใช้ append_safe"""
+    _NO_BLIND_RETRY = {"append_row", "append_rows"}
+
+    def __init__(self, obj):
+        object.__setattr__(self, "_obj", obj)
+
+    def __getattr__(self, name):
+        attr = getattr(self._obj, name)
+        if not callable(attr):
+            return attr
+
+        def call(*args, **kwargs):
+            res = attr(*args, **kwargs) if name in self._NO_BLIND_RETRY else call_with_retry(attr, *args, **kwargs)
+            if _is_sheet_like(res):
+                return _Retrying(res)
+            if isinstance(res, list) and res and all(_is_sheet_like(w) for w in res):
+                return [_Retrying(w) for w in res]
+            return res
+        return call
+
+
+def _is_blank(values) -> bool:
+    """แท็บว่างจริงหรือไม่ (gspread คืน [[]] เมื่อแท็บว่าง ดังนั้นห้ามเช็คจาก len หรือ not)"""
+    return not any((c or "").strip() for row in values for c in row)
 
 
 def get_open_spreadsheet(sheet_id_env: str):
@@ -57,7 +152,7 @@ def get_open_spreadsheet(sheet_id_env: str):
     scopes = ["https://www.googleapis.com/auth/spreadsheets"]
     creds = Credentials.from_service_account_file(creds_path, scopes=scopes)
     gc = gspread.authorize(creds)
-    return gc.open_by_key(sheet_id)
+    return _Retrying(call_with_retry(gc.open_by_key, sheet_id))
 
 
 def get_trigger_label() -> str:
@@ -110,11 +205,13 @@ def get_or_create_worksheet(sh, title: str, rows: int, cols: int):
 
 def push_to_log(sh, date_str: str, time_str: str, workflow_name: str, trigger_label: str,
                  status: str, rows_sent, detail: str = ""):
+    detail = f"[{SCRIPT_NAME} v{__version__}] {detail}".strip()
     ws = get_or_create_worksheet(sh, LOG_SHEET_NAME, rows=2000, cols=10)
-    if len(ws.get_all_values()) == 0:
-        ws.append_row(LOG_HEADERS, value_input_option="USER_ENTERED", table_range="A1")
+    if _is_blank(call_with_retry(ws.get_all_values)):
+        call_with_retry(ws.append_row, LOG_HEADERS, value_input_option="USER_ENTERED", table_range="A1")
 
-    ws.append_row(
+    call_with_retry(
+        ws.append_row,
         [date_str, time_str, workflow_name, trigger_label, status, rows_sent, detail],
         value_input_option="USER_ENTERED",
         table_range="A1",
@@ -127,7 +224,7 @@ def sync_once():
     time_str = now.strftime("%H:%M")
     trigger_label = get_trigger_label()
     workflow_name = get_workflow_name()
-    print(f"[{date_str} {time_str} เวลาไทย] เริ่ม sync SetDatabase ไปยังชีทปลายทาง "
+    print(f"[{date_str} {time_str} เวลาไทย] {SCRIPT_NAME} v{__version__} เริ่ม sync SetDatabase ไปยังชีทปลายทาง "
           f"(workflow: {workflow_name}, trigger: {trigger_label})")
 
     source_sh = get_open_spreadsheet("GSHEET_ID")
@@ -140,7 +237,7 @@ def sync_once():
         push_to_log(source_sh, date_str, time_str, workflow_name, trigger_label, "Failed", 0, detail)
         raise
 
-    if not all_values:
+    if _is_blank(all_values):
         print("  ไม่พบข้อมูลในแท็บ SetDatabase ต้นทาง -> ข้าม sync รอบนี้")
         push_to_log(source_sh, date_str, time_str, workflow_name, trigger_label, "NoData", 0,
                     "ไม่พบข้อมูลในแท็บ SetDatabase ต้นทาง")
